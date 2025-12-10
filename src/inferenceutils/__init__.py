@@ -1,20 +1,37 @@
 """
-InferenceUtils - Hardware Inspection with Pydantic Schemas
+InferenceUtils - Hardware detection and model validation for LLM inference.
 
-A comprehensive hardware inspection library with type-safe Pydantic schemas
-for LLM inference engine recommendations.
+Submodules:
+    - inferenceutils.hardware: System hardware detection
+    - inferenceutils.models: Model preflight checks
+    - inferenceutils.build: Build configuration utilities
 """
 
-from .hardware_schema import HardwareProfile, OptimalInferenceEngine
-from .system_info import systeminfo
-from .llama_cpp_env import llama_cpp_build_args
-from .inference_engine import optimal_inference_engine
+# Import submodules for namespace access (iu.hardware.system_info())
+from . import hardware
+from . import models
+from . import build
 
-__version__ = "0.1.0"
+# Top-level convenience exports (most common operations)
+from .hardware import system_info, recommended_engine
+from .models import model_preflight, can_load, PreflightResult, Engine
+from .build import llama_cpp_args, install_command
+
+__version__ = "0.2.0"
+
 __all__ = [
-    "HardwareProfile",
-    "OptimalInferenceEngine",
-    "systeminfo",
-    "optimal_inference_engine",
-    "llama_cpp_build_args",
+    # Submodules
+    "hardware",
+    "models", 
+    "build",
+    
+    # Primary API
+    "system_info",
+    "recommended_engine",
+    "model_preflight",
+    "can_load",
+    "PreflightResult",
+    "Engine",
+    "llama_cpp_args",
+    "install_command",
 ]

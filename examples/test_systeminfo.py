@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Test script for the systeminfo() function
+Test script for the system_info() function
 """
 
-from inferenceutils import systeminfo
+from inferenceutils import system_info
 
 
 def main():
     print("Getting system information...")
 
     # Get system info as Pydantic BaseModel
-    info = systeminfo()
+    info = system_info()
 
     print(f"\n=== System Information ===")
     print(f"OS: {info.os.platform} {info.os.version} ({info.os.architecture})")

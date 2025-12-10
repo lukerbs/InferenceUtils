@@ -8,30 +8,26 @@ with dependencies as a validated Pydantic BaseModel.
 """
 
 from typing import List
-from .system_info import systeminfo
+from .system_info import system_info
 from .engine_selector import Recommender
 from .hardware_schema import OptimalInferenceEngine
 
 
-def optimal_inference_engine() -> OptimalInferenceEngine:
+def recommended_engine() -> OptimalInferenceEngine:
     """
-    Get optimal inference engine recommendation with dependencies as a validated Pydantic BaseModel.
-    
-    This function uses systeminfo() to detect hardware capabilities and the Recommender
-    to determine the best inference engine, then returns a structured object containing
-    the engine name, required dependencies, and reasoning.
+    Get optimal inference engine recommendation based on detected hardware.
     
     Returns:
-        OptimalInferenceEngine: A validated Pydantic BaseModel containing engine recommendation
+        OptimalInferenceEngine: Engine name, pip dependencies, and reasoning
         
     Example:
-        >>> engine = optimal_inference_engine()
-        >>> print(f"Engine: {engine.name}")
-        >>> print(f"Dependencies: {engine.dependencies}")
-        >>> print(f"Reason: {engine.reason}")
+        >>> from inferenceutils.hardware import recommended_engine
+        >>> engine = recommended_engine()
+        >>> print(f"Use: {engine.name}")
+        >>> print(f"Install: pip install {' '.join(engine.dependencies)}")
     """
     # Get hardware information
-    hw_info = systeminfo()
+    hw_info = system_info()
     
     # Get engine recommendation
     recommender = Recommender()

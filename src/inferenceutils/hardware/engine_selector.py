@@ -24,6 +24,8 @@ import platform
 import json
 from typing import Dict, Any, List, Optional, Union
 
+from .macos_memory import get_macos_memory_stats
+
 # --- Constants ---
 # Define instruction sets critical for AI/ML workloads
 AI_INSTRUCTION_SETS = {
@@ -121,20 +123,39 @@ class HardwareInspector:
         ram_data = {
             "total_gb": None,
             "available_gb": None,
+            "details": None
         }
         
-        psutil = self._safe_import("psutil")
-        if psutil:
+        if self.hw_info["os"]["platform"] == "Darwin":
+            # macOS: Use accurate Mach kernel API
             try:
-                mem = psutil.virtual_memory()
-                ram_data["total_gb"] = round(mem.total / (1024**3), 2)
-                ram_data["available_gb"] = round(mem.available / (1024**3), 2)
-            except Exception as e:
-                # print(f"Warning: psutil failed to get RAM usage. Error: {e}", file=sys.stderr)
-                pass
-
-        # RAM Speed: Explicitly removed as per directive. Cannot be obtained reliably
-        # without elevated privileges or subprocess parsing.
+                ram_data = get_macos_memory_stats()
+            except (OSError, AttributeError) as e:
+                # Fallback to psutil if Mach API fails (OSError from syscall failures)
+                psutil = self._safe_import("psutil")
+                if psutil:
+                    try:
+                        mem = psutil.virtual_memory()
+                        ram_data = {
+                            "total_gb": round(mem.total / (1024**3), 2),
+                            "available_gb": round(mem.available / (1024**3), 2),
+                            "details": None
+                        }
+                    except Exception:
+                        pass  # Keep default None values
+        else:
+            # Linux/Windows: Use psutil
+            psutil = self._safe_import("psutil")
+            if psutil:
+                try:
+                    mem = psutil.virtual_memory()
+                    ram_data = {
+                        "total_gb": round(mem.total / (1024**3), 2),
+                        "available_gb": round(mem.available / (1024**3), 2),
+                        "details": None
+                    }
+                except Exception:
+                    pass  # Keep default None values
         
         self.hw_info["ram"] = ram_data
 

@@ -30,10 +30,21 @@ class CPU(BaseModel):
     instruction_sets: Optional[List[str]] = Field(None, description="List of supported instruction sets (e.g., ['avx2', 'avx512f', 'neon'])")
 
 
+class MacOSMemoryDetails(BaseModel):
+    """macOS-specific memory breakdown using Mach kernel API."""
+    cached_files_gb: float = Field(description="File cache (instantly evictable)")
+    wired_gb: float = Field(description="Kernel wired memory (non-evictable)")
+    compressed_gb: float = Field(description="Memory held in compressed state")
+    app_memory_gb: float = Field(description="Active application memory")
+    speculative_gb: float = Field(description="Read-ahead cache (instantly evictable)")
+    page_size_bytes: int = Field(description="Hardware page size (16384 on Apple Silicon, 4096 on Intel)")
+
+
 class RAM(BaseModel):
     """Random Access Memory information."""
     total_gb: Optional[float] = Field(None, description="Total RAM in gigabytes")
     available_gb: Optional[float] = Field(None, description="Available RAM in gigabytes")
+    details: Optional[MacOSMemoryDetails] = Field(None, description="Platform-specific memory details")
 
 
 class Storage(BaseModel):

@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
 """
-Test script for the llama_cpp_build_args() function
+Test script for the llama_cpp_args() function
 """
 
-from inferenceutils import (
-    systeminfo,
-    llama_cpp_build_args,
-    get_llama_cpp_install_command,
-    get_llama_cpp_install_command_windows,
-)
+from inferenceutils import system_info, llama_cpp_args, install_command
 import platform
 
 
@@ -17,7 +12,7 @@ def main():
 
     # Get system info
     print("Detecting hardware...")
-    hw_info = systeminfo()
+    hw_info = system_info()
 
     print(f"OS: {hw_info.os.platform} {hw_info.os.version} ({hw_info.os.architecture})")
     print(f"CPU: {hw_info.cpu.brand_raw}")
@@ -46,7 +41,7 @@ def main():
 
     # Get optimal build arguments
     print("\nGenerating optimal LLaMA.cpp build arguments...")
-    build_args = llama_cpp_build_args()
+    build_args = llama_cpp_args()
 
     if build_args:
         print(f"\nOptimal CMAKE arguments:")
@@ -58,10 +53,8 @@ def main():
 
         # Show install command
         print(f"\nInstall command for {platform.system()}:")
-        if platform.system() == "Windows":
-            install_cmd = get_llama_cpp_install_command_windows()
-        else:
-            install_cmd = get_llama_cpp_install_command()
+        shell = "powershell" if platform.system() == "Windows" else "bash"
+        install_cmd = install_command(shell=shell)
 
         print(f"  {install_cmd}")
 

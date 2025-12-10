@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-Test script for the optimal_inference_engine() function
+Test script for the recommended_engine() function
 """
 
-from inferenceutils import optimal_inference_engine, systeminfo
+from inferenceutils import recommended_engine, system_info
 
 
 def main():
-    print("=== Optimal Inference Engine Recommendation ===\n")
+    print("=== Recommended Inference Engine ===\n")
 
     # Get system info for context
     print("Detecting hardware...")
-    hw_info = systeminfo()
+    hw_info = system_info()
 
     print(f"OS: {hw_info.os.platform} {hw_info.os.version} ({hw_info.os.architecture})")
     print(f"CPU: {hw_info.cpu.brand_raw}")
@@ -20,9 +20,9 @@ def main():
 
     print("\n" + "=" * 50)
 
-    # Get optimal inference engine recommendation
-    print("\nGetting optimal inference engine recommendation...")
-    engine = optimal_inference_engine()
+    # Get recommended inference engine
+    print("\nGetting recommended inference engine...")
+    engine = recommended_engine()
 
     print(f"\n=== Recommendation ===")
     print(f"Engine: {engine.name}")
@@ -39,8 +39,8 @@ def main():
     # Special handling for llama.cpp
     if engine.name == "llama.cpp":
         print("\nNote: For optimal llama.cpp performance, consider using the build arguments:")
-        print("from inferenceutils import llama_cpp_build_args")
-        print("args = llama_cpp_build_args()")
+        print("from inferenceutils import llama_cpp_args")
+        print("args = llama_cpp_args()")
         print("print(' '.join(args))")
 
     # Demonstrate Pydantic features

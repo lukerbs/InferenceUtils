@@ -33,9 +33,12 @@ dependencies = [
     "amdsmi",
     "openvino",
     "mlx",
-    "pyobjc",
+    "pyobjc-core; sys_platform == 'darwin'",
+    "pyobjc-framework-Cocoa; sys_platform == 'darwin'",
     "vulkan",
-    "pydantic"
+    "pydantic",
+    "gguf",
+    "huggingface-hub",
 ]
 
 [project.optional-dependencies]

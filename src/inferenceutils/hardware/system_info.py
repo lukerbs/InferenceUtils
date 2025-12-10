@@ -12,7 +12,7 @@ from .engine_selector import HardwareInspector
 from .hardware_schema import HardwareProfile
 
 
-def systeminfo() -> HardwareProfile:
+def system_info() -> HardwareProfile:
     """
     Get comprehensive system hardware information as a validated Pydantic BaseModel.
     
@@ -23,12 +23,11 @@ def systeminfo() -> HardwareProfile:
         HardwareProfile: A validated Pydantic BaseModel containing all hardware information
         
     Example:
-        >>> info = systeminfo()
-        >>> print(f"OS: {info.os.platform}")
-        >>> print(f"CPU: {info.cpu.brand_raw}")
-        >>> print(f"RAM: {info.ram.total_gb} GB")
-        >>> if info.gpu.detected_vendor:
-        ...     print(f"GPU Vendor: {info.gpu.detected_vendor}")
+        >>> from inferenceutils.hardware import system_info
+        >>> hw = system_info()
+        >>> print(f"OS: {hw.os.platform}")
+        >>> print(f"CPU: {hw.cpu.brand_raw}")
+        >>> print(f"RAM: {hw.ram.total_gb} GB")
     """
     # Create hardware inspector and gather data
     inspector = HardwareInspector()

@@ -1,302 +1,161 @@
-# InferenceUtils - Intelligent Hardware Detection for LLM Inference
+# InferenceUtils
 
-A comprehensive Python library that automatically detects your hardware capabilities and provides optimal recommendations for LLM inference engines and build configurations.
+> **Stop guessing. Start engineering.**  
+> Hardware introspection and memory validation for cross-platform LLM inference
 
-## 🚀 Quick Start
+A single, consistent interface for local AI that handles the hardware differences between Mac, Windows, and Linux—giving you one reliable answer to: *Can I run this LLM model? Should I run this LLM model? And which inference engine works best for my device?*
+
+**InferenceUtils** solves the "Matrix from Hell" in local AI: the complex interplay between your hardware, operating system, model architecture, and inference engine. It replaces trial and error with engineering rigor.
+
+## The Problem
+
+Building cross-platform LLM applications involves four recurring engineering challenges:
+
+1. **"Can I run this?" / "Should I run this?"** - Will this model fit in RAM? Will it crash during inference when the KV cache fills up? Will it thrash and become unusable even if it technically loads?
+
+2. **The Build Configuration Maze** - Installing `llama-cpp-python` with the right CMAKE flags for your exact hardware (Metal vs CUDA vs ROCm vs CPU-only), turning a simple `pip install` into a 20-minute debugging session.
+
+3. **Hardware Detection Fragility** - Querying hardware specs across macOS/Linux/Windows, Apple Silicon/Intel/NVIDIA/AMD, unified memory vs discrete VRAM—each requiring different APIs and shell commands that break with OS updates.
+
+4. **Engine Selection Guesswork** - Choosing between MLX, vLLM, llama.cpp, TensorRT-LLM, and OpenVINO based on your hardware capabilities and model requirements.
+
+**InferenceUtils solves all four** with a single, type-safe interface that validates memory before loading, auto-generates build configurations, detects hardware cross-platform, and recommends optimal engines.
+
+---
+
+## Quick Start
 
 ```python
-from inferenceutils import systeminfo, optimal_inference_engine, llama_cpp_build_args
+from inferenceutils import system_info, recommended_engine, model_preflight, llama_cpp_args
 
-# Get comprehensive hardware information
-hw = systeminfo()
-print(f"CPU: {hw.cpu.brand_raw}")
-print(f"GPU: {hw.gpu.detected_vendor}")
-print(f"RAM: {hw.ram.total_gb} GB")
+# Detect hardware capabilities
+hw = system_info()
+print(f"CPU: {hw.cpu.brand_raw}, RAM: {hw.ram.available_gb} GB")
+# Output: CPU: Apple M4 Pro, RAM: 17.0 GB
 
-# Get optimal inference engine recommendation
-engine = optimal_inference_engine()
-print(f"Recommended: {engine.name}")
-print(f"Install: pip install {' '.join(engine.dependencies)}")
+# Get recommended inference engine
+engine = recommended_engine()
+print(f"Use {engine.name}: {engine.reason}")
+# Output: Use MLX: Apple Silicon detected with Metal support
 
-# Get optimal build arguments for llama-cpp-python
-args = llama_cpp_build_args()
+# Validate model will fit in RAM before loading
+result = model_preflight("mlx-community/Llama-3-8B-4bit", engine="mlx")
+if result.can_load:
+    print(f"✓ Safe to load with {result.recommended_context:,} token context")
+    # Output: ✓ Safe to load with 131,072 token context
+else:
+    print(f"✗ Won't fit in RAM: {result.message}")
+    # Example: Model requires 21.0 GB but only 15.0 GB available
+
+# Generate optimal llama.cpp build arguments
+args = llama_cpp_args()
 print(f"CMAKE_ARGS: {' '.join(args)}")
+# Output: CMAKE_ARGS: -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=Accelerate -DGGML_METAL=ON
 ```
 
-## ✨ Key Features
+For detailed API documentation, see [`docs/USAGE.md`](docs/USAGE.md). For runnable examples, explore the [`examples/`](examples/) directory.
 
-### **🔍 Intelligent Hardware Detection**
-- **Cross-platform**: macOS, Linux, Windows
-- **Comprehensive**: CPU, GPU, RAM, storage, instruction sets
-- **Type-safe**: All data validated with Pydantic schemas
-- **Pure Python**: No external command execution required
+---
 
-### **🎯 Optimal Engine Recommendations**
-- **Hardware-aware**: Automatically selects best engine for your system
-- **Dependencies included**: Provides exact pip install commands
-- **Detailed reasoning**: Explains why each engine was chosen
-- **Performance-focused**: Prioritizes fastest available hardware
+## Key Features
 
-### **⚡ Build Optimization**
-- **llama-cpp-python**: Optimal CMAKE arguments for your hardware
-- **GPU acceleration**: CUDA, Metal, ROCm, Vulkan, SYCL
-- **CPU optimization**: AVX-512, AVX2, OpenMP, KleidiAI
-- **Platform-specific**: Different optimizations per OS
+- **Memory Validation** - Graduated warnings (< 70% = safe, 70-85% = tight, > 85% = failed) + safe context limits accounting for KV cache growth. Prevents OOM crashes during inference.
 
-## 📦 Installation
+- **Build Optimization** - Auto-generates CMAKE flags for `llama-cpp-python` based on your hardware (Metal, CUDA, ROCm, AVX-512). Turns 20-minute debugging into copy-paste commands.
+
+- **Cross-Platform Hardware API** - Unified interface for CPU, GPU, RAM, NPU across macOS/Linux/Windows. Native APIs (Mach kernel, nvidia-ml-py, amdsmi) instead of fragile shell parsing.
+
+- **Smart Engine Selection** - Recommends optimal backend (MLX, vLLM, llama.cpp, TensorRT-LLM, OpenVINO) based on detected hardware and model requirements.
+
+- **Architecture-Aware Math** - Accounts for GQA (Grouped Query Attention), MoE (Mixture of Experts), precise quantization (Q4_K_M = 4.85 bits, not 4.0), and backend-specific overhead.
+
+- **Type Safety** - Pydantic schemas with validation, IDE autocomplete, and `.model_dump_json()` serialization.
+
+---
+
+## Installation
+
+**From PyPI** (once published):
 
 ```bash
-# Install from source
-git clone <repository-url>
+pip install inferenceutils
+```
+
+**From GitHub**:
+
+```bash
+pip install git+https://github.com/yourusername/InferenceUtils.git
+```
+
+**From source**:
+
+```bash
+git clone https://github.com/yourusername/InferenceUtils.git
 cd InferenceUtils
 pip install -e .
-
-# Or install dependencies manually
-pip install py-cpuinfo psutil nvidia-ml-py amdsmi openvino mlx pyobjc vulkan pydantic
 ```
 
-## 🛠️ API Reference
+---
 
-### Core Functions
+## Supported Platforms
 
-#### `systeminfo() -> HardwareProfile`
-Get comprehensive hardware information as a validated Pydantic BaseModel.
+| Platform | Hardware Detected | Special Features |
+|----------|-------------------|------------------|
+| **macOS** | Apple Silicon (M1/M2/M3/M4), Intel | 16KB page size support, Mach kernel memory API, Metal detection, Neural Engine |
+| **Linux** | NVIDIA, AMD (ROCm), Intel | NVML bindings, AMDSMI integration, CUDA compute capability |
+| **Windows** | NVIDIA, Intel | WMI storage detection, CUDA version matching, Intel oneAPI |
 
-```python
-from inferenceutils import systeminfo
+---
 
-hw = systeminfo()
+## How It Works
 
-# Access typed data
-print(f"OS: {hw.os.platform}")
-print(f"CPU: {hw.cpu.brand_raw}")
-print(f"RAM: {hw.ram.total_gb} GB")
+InferenceUtils acts as a **physics engine for LLM inference**—simulating memory and performance before execution to prevent runtime failures.
 
-# GPU information
-if hw.gpu.detected_vendor == "NVIDIA":
-    for gpu in hw.gpu.nvidia:
-        print(f"NVIDIA: {gpu.model} ({gpu.vram_gb} GB)")
-elif hw.gpu.detected_vendor == "Apple":
-    print(f"Apple: {hw.gpu.apple.model}")
+### 1. Native API Integration
+Queries hardware through stable binary interfaces (Mach kernel, nvidia-ml-py, amdsmi) instead of fragile shell parsing. Production-grade reliability that doesn't break with driver updates or locale changes.
 
-# Convert to JSON
-json_data = hw.model_dump_json(indent=2)
-```
+### 2. Architecture-Aware Memory Simulation
 
-#### `optimal_inference_engine() -> OptimalInferenceEngine`
-Get the optimal inference engine recommendation with dependencies.
+Most calculators just check file size. InferenceUtils simulates the full runtime:
 
-```python
-from inferenceutils import optimal_inference_engine
+- **Architecture Inspection** - Reads `config.json`/GGUF headers for `num_kv_heads` (GQA awareness), `num_experts` (MoE), vocabulary size
+- **Backend-Specific Overhead** - MLX graph compilation scratch space, vLLM PagedAttention pre-allocation, llama.cpp KV cache initialization
+- **OS Memory Calculation** - On macOS, adds evictable memory (`cached_files` + `speculative`) to available RAM—often unlocks gigabytes
+- **Quantization Precision** - Calculates true bits-per-weight (Q4_K_M = 4.85 bits, not 4.0). That 0.85-bit difference determines fit vs failure.
 
-engine = optimal_inference_engine()
+### 3. Hardware-Optimized Builds
+Detects CUDA compute capability (sm_89 for RTX 4090), Metal support, ROCm compatibility, AVX-512, then generates optimal CMAKE flags. Handles edge cases like the Apple Silicon SVE hang bug.
 
-print(f"Engine: {engine.name}")
-print(f"Dependencies: {engine.dependencies}")
-print(f"Reason: {engine.reason}")
+---
 
-# Install the recommended engine
-install_cmd = f"pip install {' '.join(engine.dependencies)}"
-print(f"Run: {install_cmd}")
-```
+## What `system_info()` Returns
 
-#### `llama_cpp_build_args() -> List[str]`
-Get optimal CMAKE build arguments for llama-cpp-python.
+The `system_info()` function returns a single `HardwareProfile` object with complete hardware information in one call:
 
-```python
-from inferenceutils import llama_cpp_build_args, get_llama_cpp_install_command
+| Category | Key Fields | Description |
+|----------|-----------|-------------|
+| **OS** | `platform`, `version`, `architecture` | Operating system details |
+| **CPU** | `brand_raw`, `cores`, `instruction_sets` | CPU model, cores, AI extensions (AVX-512, NEON, AMX) |
+| **RAM** | `total_gb`, `available_gb`, `details.*` | Memory stats + macOS Mach kernel breakdown |
+| **GPU** | `nvidia`, `amd`, `apple`, `intel` | Per-vendor arrays with VRAM, drivers, compute capability |
+| **NPU** | `vendor`, `model_name`, `cores` | Neural processor detection (Apple Neural Engine, Intel AI Boost) |
+| **Storage** | `primary_type` | SSD/NVMe vs HDD detection |
+| **Engine** | `recommended_engine.name` | Optimal inference backend for your hardware |
 
-# Get build arguments
-args = llama_cpp_build_args()
-print(f"CMAKE arguments: {' '.join(args)}")
+**Example fields:**
+- `hw.gpu.nvidia[0].compute_capability` → `8.9` (RTX 4090)
+- `hw.gpu.apple.gpu_cores` → `20` (M4 Pro)
+- `hw.ram.details.cached_files_gb` → `4.2` (macOS evictable memory)
+- `hw.cpu.instruction_sets` → `["AVX2", "AVX-512"]`
 
-# Get complete install command
-install_cmd = get_llama_cpp_install_command()
-print(f"Install command: {install_cmd}")
-```
+All fields are type-safe Pydantic models with `.model_dump()` and `.model_dump_json()` for serialization.
 
-### Pydantic Schemas
+See [`docs/USAGE.md`](docs/USAGE.md) for the complete schema reference.
 
-#### `HardwareProfile`
-Complete hardware profile with all detected components.
+---
 
-```python
-from inferenceutils import HardwareProfile
+## Documentation
 
-# Validate hardware data
-try:
-    profile = HardwareProfile(**hardware_data)
-    print("✅ Data is valid")
-except ValidationError as e:
-    print(f"❌ Validation failed: {e}")
-```
+- **[API Reference](docs/USAGE.md)** - Complete function signatures, schemas, and usage patterns
+- **[Examples](examples/)** - Runnable scripts for all features (`test_model_preflight.py`, `test_systeminfo.py`, etc.)
 
-#### `OptimalInferenceEngine`
-Inference engine recommendation with dependencies.
-
-```python
-from inferenceutils import OptimalInferenceEngine
-
-# Create recommendation
-recommendation = OptimalInferenceEngine(
-    name="MLX",
-    dependencies=["mlx-lm"],
-    reason="Optimized for Apple Silicon"
-)
-```
-
-## 🎯 Supported Inference Engines
-
-| Engine | Best For | Dependencies |
-|--------|----------|--------------|
-| **TensorRT-LLM** | High-end NVIDIA GPUs (Ampere+) | `tensorrt-llm` |
-| **vLLM** | NVIDIA GPUs (Turing/Volta+) | `vllm` |
-| **MLX** | Apple Silicon | `mlx-lm` |
-| **OpenVINO** | Intel GPUs/NPUs | `openvino` |
-| **llama.cpp** | AMD GPUs, high-performance CPUs | `llama-cpp-python` |
-
-## 🔧 Hardware Acceleration Support
-
-### GPU Backends
-- **NVIDIA CUDA**: Automatic compute capability detection
-- **Apple Metal**: Native Apple Silicon optimization
-- **AMD ROCm**: HIP acceleration for AMD GPUs
-- **Intel SYCL**: oneAPI for Intel accelerators
-- **Vulkan**: Cross-platform GPU acceleration
-
-### CPU Optimizations
-- **Intel oneMKL**: AVX-512 optimization
-- **OpenBLAS**: AVX2 acceleration
-- **OpenMP**: Multi-core parallelism
-- **KleidiAI**: ARM CPU optimization
-
-## 📋 Example Output
-
-### Hardware Detection
-```json
-{
-  "os": {
-    "platform": "Darwin",
-    "version": "23.0.0",
-    "architecture": "arm64"
-  },
-  "cpu": {
-    "brand_raw": "Apple M2 Pro",
-    "physical_cores": 10,
-    "logical_cores": 10,
-    "instruction_sets": ["neon"]
-  },
-  "ram": {
-    "total_gb": 32.0,
-    "available_gb": 24.5
-  },
-  "gpu": {
-    "detected_vendor": "Apple",
-    "apple": {
-      "model": "Apple Silicon GPU",
-      "vram_gb": 32.0,
-      "metal_supported": true
-    }
-  }
-}
-```
-
-### Engine Recommendation
-```json
-{
-  "name": "MLX",
-  "dependencies": ["mlx-lm"],
-  "reason": "Natively designed for Apple Silicon. The system's unified memory architecture is best exploited by Apple's own MLX framework, which leverages the CPU, GPU, and Neural Engine."
-}
-```
-
-### Build Arguments
-```bash
-# Apple Silicon
--DGGML_METAL=ON -DGGML_SVE=OFF -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=Accelerate
-
-# NVIDIA GPU
--DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS
-```
-
-## 🚀 Use Cases
-
-### Development Setup
-```python
-from inferenceutils import systeminfo, optimal_inference_engine
-
-# Quick hardware overview
-hw = systeminfo()
-print(f"Setting up development environment for {hw.cpu.brand_raw}")
-
-# Get recommended engine
-engine = optimal_inference_engine()
-print(f"Installing {engine.name}...")
-```
-
-### CI/CD Pipelines
-```python
-from inferenceutils import llama_cpp_build_args
-
-# Generate build args for different runners
-args = llama_cpp_build_args()
-print(f"Building with: {' '.join(args)}")
-```
-
-### User Documentation
-```python
-from inferenceutils import optimal_inference_engine, get_llama_cpp_install_command
-
-# Generate user-specific instructions
-engine = optimal_inference_engine()
-if engine.name == "llama.cpp":
-    install_cmd = get_llama_cpp_install_command()
-    print(f"Run: {install_cmd}")
-else:
-    print(f"Run: pip install {' '.join(engine.dependencies)}")
-```
-
-## 🔍 Hardware Detection Capabilities
-
-### CPU Detection
-- Model and architecture
-- Core count (physical/logical)
-- Instruction sets (AVX-512, AVX2, NEON, AMX)
-- Performance characteristics
-
-### GPU Detection
-- **NVIDIA**: Model, VRAM, compute capability, driver version
-- **AMD**: Model, VRAM, ROCm compatibility, compute units
-- **Intel**: Model, type (dGPU/iGPU/NPU), execution units
-- **Apple**: Model, unified memory, Metal support, GPU cores
-
-### Memory & Storage
-- Total and available RAM
-- Primary storage type (SSD/HDD)
-- Memory bandwidth considerations
-
-### NPU Detection
-- **Apple Neural Engine**: Core count, availability
-- **Intel AI Boost**: NPU detection and capabilities
-- **AMD Ryzen AI**: CPU-based detection
-
-## 🛠️ Dependencies
-
-### Core Dependencies
-- **py-cpuinfo**: CPU information
-- **psutil**: System and process utilities
-- **nvidia-ml-py**: NVIDIA GPU monitoring
-- **openvino**: Intel accelerator support
-- **mlx**: Apple Silicon support
-- **pyobjc**: macOS system integration
-- **vulkan**: Vulkan API support
-- **pydantic**: Data validation and serialization
-- **amdsmi**: AMD GPU monitoring (install with `pip install inferenceutils[amd]`)
-
-## 📄 License
-
-MIT License - see LICENSE file for details.
-
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
