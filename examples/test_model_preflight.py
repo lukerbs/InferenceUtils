@@ -4,7 +4,7 @@ Test script for model_preflight() function
 Tests if a specific model can run on the current hardware
 """
 
-from inferenceutils import model_preflight, system_info
+from edgekit import model_preflight, system_info
 
 # Model to test
 # LLM_MODEL = "mlx-community/gemma-3n-E4B-it-lm-4bit"

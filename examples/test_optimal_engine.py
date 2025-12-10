@@ -3,7 +3,7 @@
 Test script for the recommended_engine() function
 """
 
-from inferenceutils import recommended_engine, system_info
+from edgekit import recommended_engine, system_info
 
 
 def main():
@@ -39,7 +39,7 @@ def main():
     # Special handling for llama.cpp
     if engine.name == "llama.cpp":
         print("\nNote: For optimal llama.cpp performance, consider using the build arguments:")
-        print("from inferenceutils import llama_cpp_args")
+        print("from edgekit import llama_cpp_args")
         print("args = llama_cpp_args()")
         print("print(' '.join(args))")
 

@@ -737,7 +737,7 @@ def model_preflight(
         PreflightResult with status and recommendations
         
     Examples:
-        >>> from inferenceutils.models import model_preflight
+        >>> from edgekit.models import model_preflight
         >>> 
         >>> # Option 1: HuggingFace repo ID (auto-downloads/caches)
         >>> result = model_preflight("mlx-community/Llama-3-8B-4bit", engine="mlx")
@@ -785,7 +785,7 @@ def can_load(
         True if model can load, False otherwise
         
     Examples:
-        >>> from inferenceutils.models import can_load
+        >>> from edgekit.models import can_load
         >>> 
         >>> # Check HuggingFace model
         >>> if can_load("mlx-community/Llama-3-8B-4bit", engine="mlx"):

@@ -22,7 +22,7 @@ def llama_cpp_args() -> List[str]:
         List[str]: CMAKE arguments for optimal hardware acceleration
         
     Example:
-        >>> from inferenceutils.build import llama_cpp_args
+        >>> from edgekit.build import llama_cpp_args
         >>> args = llama_cpp_args()
         >>> print(" ".join(args))
         -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=Accelerate -DGGML_METAL=ON
@@ -101,7 +101,7 @@ def install_command(shell: str = "auto") -> str:
         str: Complete pip install command with CMAKE_ARGS
         
     Example:
-        >>> from inferenceutils.build import install_command
+        >>> from edgekit.build import install_command
         >>> print(install_command())
         CMAKE_ARGS="-DGGML_METAL=ON ..." pip install llama-cpp-python
     """

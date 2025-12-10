@@ -3,7 +3,7 @@
 Test script for the system_info() function
 """
 
-from inferenceutils import system_info
+from edgekit import system_info
 
 
 def main():

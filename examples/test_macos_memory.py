@@ -4,7 +4,7 @@ Test script for macOS memory detection using Mach kernel API
 """
 
 import platform
-from inferenceutils import system_info
+from edgekit import system_info
 
 
 def main():

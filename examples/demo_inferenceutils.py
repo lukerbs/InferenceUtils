@@ -1,4 +1,4 @@
-from inferenceutils import system_info, recommended_engine, model_preflight
+from edgekit import system_info, recommended_engine, model_preflight
 
 # Get system hardware information
 hw = system_info()

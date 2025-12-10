@@ -3,7 +3,7 @@
 Test script for the llama_cpp_args() function
 """
 
-from inferenceutils import system_info, llama_cpp_args, install_command
+from edgekit import system_info, llama_cpp_args, install_command
 import platform
 
 

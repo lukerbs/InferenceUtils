@@ -21,7 +21,7 @@ def recommended_engine() -> OptimalInferenceEngine:
         OptimalInferenceEngine: Engine name, pip dependencies, and reasoning
         
     Example:
-        >>> from inferenceutils.hardware import recommended_engine
+        >>> from edgekit.hardware import recommended_engine
         >>> engine = recommended_engine()
         >>> print(f"Use: {engine.name}")
         >>> print(f"Install: pip install {' '.join(engine.dependencies)}")

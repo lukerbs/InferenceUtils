@@ -23,7 +23,7 @@ def system_info() -> HardwareProfile:
         HardwareProfile: A validated Pydantic BaseModel containing all hardware information
         
     Example:
-        >>> from inferenceutils.hardware import system_info
+        >>> from edgekit.hardware import system_info
         >>> hw = system_info()
         >>> print(f"OS: {hw.os.platform}")
         >>> print(f"CPU: {hw.cpu.brand_raw}")

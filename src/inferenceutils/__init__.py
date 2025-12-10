@@ -1,10 +1,10 @@
 """
-InferenceUtils - Hardware detection and model validation for LLM inference.
+EdgeKit - Hardware detection and model validation for LLM inference.
 
 Submodules:
-    - inferenceutils.hardware: System hardware detection
-    - inferenceutils.models: Model preflight checks
-    - inferenceutils.build: Build configuration utilities
+    - edgekit.hardware: System hardware detection
+    - edgekit.models: Model preflight checks
+    - edgekit.build: Build configuration utilities
 """
 
 # Import submodules for namespace access (iu.hardware.system_info())

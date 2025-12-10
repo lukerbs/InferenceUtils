@@ -3,7 +3,7 @@ requires = ["setuptools>=64.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "inferenceutils"
+name = "edgekit"
 version = "0.1.0"
 description = "Hardware inspection with Pydantic schemas for LLM inference engine recommendations"
 readme = "README.md"
@@ -48,9 +48,9 @@ test = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/user/inferenceutils"
-Repository = "https://github.com/user/inferenceutils"
-"Bug Tracker" = "https://github.com/user/inferenceutils/issues"
+Homepage = "https://github.com/user/edgekit"
+Repository = "https://github.com/user/edgekit"
+"Bug Tracker" = "https://github.com/user/edgekit/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"] 

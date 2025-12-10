@@ -1,12 +1,12 @@
-# InferenceUtils API Reference
+# EdgeKit API Reference
 
-Complete API documentation for InferenceUtils, organized by module.
+Complete API documentation for EdgeKit, organized by module.
 
 ---
 
 ## Table of Contents
 
-- [Module: `inferenceutils.hardware`](#module-inferenceutilshardware)
+- [Module: `edgekit.hardware`](#module-edgekithardware)
   - [Functions](#hardware-functions)
     - [`system_info()`](#system_info)
     - [`recommended_engine()`](#recommended_engine)
@@ -25,7 +25,7 @@ Complete API documentation for InferenceUtils, organized by module.
     - [`Storage`](#storage)
     - [`EngineRecommendation`](#enginerecommendation)
     - [`OptimalInferenceEngine`](#optimalinferenceengine)
-- [Module: `inferenceutils.models`](#module-inferenceutilsmodels)
+- [Module: `edgekit.models`](#module-edgekitmodels)
   - [Functions](#models-functions)
     - [`model_preflight()`](#model_preflight)
     - [`can_load()`](#can_load)
@@ -35,7 +35,7 @@ Complete API documentation for InferenceUtils, organized by module.
     - [`Engine`](#engine)
     - [`MemoryEstimate`](#memoryestimate)
     - [`ModelMetadata`](#modelmetadata)
-- [Module: `inferenceutils.build`](#module-inferenceutilsbuild)
+- [Module: `edgekit.build`](#module-edgekitbuild)
   - [Functions](#build-functions)
     - [`llama_cpp_args()`](#llama_cpp_args)
     - [`install_command()`](#install_command)
@@ -47,7 +47,7 @@ Complete API documentation for InferenceUtils, organized by module.
 
 ---
 
-## Module: `inferenceutils.hardware`
+## Module: `edgekit.hardware`
 
 Hardware detection and inference engine recommendations.
 
@@ -74,7 +74,7 @@ Detects all available hardware across all platforms in a single call. Uses direc
 
 **Example:**
 ```python
-from inferenceutils import system_info
+from edgekit import system_info
 
 hw = system_info()
 print(f"CPU: {hw.cpu.brand_raw}")
@@ -110,7 +110,7 @@ Analyzes detected hardware and recommends the best inference engine. Automatical
 
 **Example:**
 ```python
-from inferenceutils import recommended_engine
+from edgekit import recommended_engine
 
 engine = recommended_engine()
 print(f"Use: {engine.name}")
@@ -345,7 +345,7 @@ Optimal inference engine recommendation with dependencies.
 
 ---
 
-## Module: `inferenceutils.models`
+## Module: `edgekit.models`
 
 Model preflight checks and memory validation.
 
@@ -389,7 +389,7 @@ The function uses model-specific memory estimation for each backend:
 
 **Example:**
 ```python
-from inferenceutils import model_preflight
+from edgekit import model_preflight
 
 # Check HuggingFace model (auto-downloads if needed)
 result = model_preflight("mlx-community/Llama-3-8B-4bit", engine="mlx")
@@ -441,7 +441,7 @@ Convenience wrapper around [`model_preflight()`](#model_preflight) that returns 
 
 **Example:**
 ```python
-from inferenceutils import can_load
+from edgekit import can_load
 
 if can_load("mlx-community/Llama-3-8B-4bit", engine="mlx"):
     # Proceed with loading
@@ -599,7 +599,7 @@ Extracted from GGUF binary headers or HuggingFace config.json files. Used for ac
 
 ---
 
-## Module: `inferenceutils.build`
+## Module: `edgekit.build`
 
 Build configuration utilities for LLM inference engines.
 
@@ -642,7 +642,7 @@ Detects hardware capabilities and returns CMAKE arguments that enable the best a
 
 **Example:**
 ```python
-from inferenceutils import llama_cpp_args
+from edgekit import llama_cpp_args
 
 args = llama_cpp_args()
 print(" ".join(args))
@@ -679,7 +679,7 @@ Generates a ready-to-run pip install command with optimal CMAKE arguments for yo
 
 **Example:**
 ```python
-from inferenceutils import install_command
+from edgekit import install_command
 
 # Auto-detect shell from OS
 cmd = install_command()
@@ -756,9 +756,9 @@ All public functions and classes include full type hints for:
 
 **Example with type hints:**
 ```python
-from inferenceutils import system_info, model_preflight
-from inferenceutils.hardware import HardwareProfile
-from inferenceutils.models import PreflightResult, Engine
+from edgekit import system_info, model_preflight
+from edgekit.hardware import HardwareProfile
+from edgekit.models import PreflightResult, Engine
 
 # Fully typed
 hw: HardwareProfile = system_info()
@@ -779,7 +779,7 @@ All Pydantic models support JSON serialization for:
 **Example:**
 ```python
 import json
-from inferenceutils import system_info, model_preflight
+from edgekit import system_info, model_preflight
 
 # Serialize to dict
 hw = system_info()
@@ -790,7 +790,7 @@ hw_json = hw.model_dump_json(indent=2)
 print(hw_json)
 
 # Deserialize from dict
-from inferenceutils.hardware import HardwareProfile
+from edgekit.hardware import HardwareProfile
 hw_restored = HardwareProfile(**hw_dict)
 
 # Validation results
