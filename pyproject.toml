@@ -48,9 +48,9 @@ test = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/user/edgekit"
-Repository = "https://github.com/user/edgekit"
-"Bug Tracker" = "https://github.com/user/edgekit/issues"
+Homepage = "https://github.com/user/InferenceUtils"
+Repository = "https://github.com/user/InferenceUtils"
+"Bug Tracker" = "https://github.com/user/InferenceUtils/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"] 

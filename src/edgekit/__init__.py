@@ -7,7 +7,7 @@ Submodules:
     - edgekit.build: Build configuration utilities
 """
 
-# Import submodules for namespace access (iu.hardware.system_info())
+# Import submodules for namespace access (edgekit.hardware.system_info())
 from . import hardware
 from . import models
 from . import build
