@@ -65,8 +65,8 @@ def main():
 
     # JSON serialization
     json_data = info.model_dump_json(indent=2)
-    print(f"\n=== JSON Output (first 500 chars) ===")
-    print(json_data[:500] + "..." if len(json_data) > 500 else json_data)
+    print(f"\n=== JSON Output ({len(json_data)} chars) ===")
+    print(json_data)
 
 
 if __name__ == "__main__":
