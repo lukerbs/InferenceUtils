@@ -25,6 +25,10 @@ import json
 from typing import Dict, Any, List, Optional, Union
 
 from .macos_memory import get_macos_memory_stats
+from .linux_memory import get_linux_memory_stats
+from .windows_memory import get_windows_memory_stats
+from .windows_dxgi import get_intel_shared_memory_limit_gb
+from ..utils import safe_import, load_iokit_functions
 
 # --- Constants ---
 # Define instruction sets critical for AI/ML workloads
@@ -58,17 +62,6 @@ class HardwareInspector:
             "npus": []
         }
 
-    def _safe_import(self, module_name: str, package_name: str = None):
-        """Safely imports a module and returns it, or None if import fails."""
-        try:
-            return __import__(module_name, fromlist=[''])
-        except ImportError:
-            # print(f"Info: '{package_name or module_name}' not found. Related features will be None.", file=sys.stderr)
-            return None
-        except Exception as e:
-            # print(f"Warning: Failed to import '{module_name}': {e}. Features will be None.", file=sys.stderr)
-            return None
-
     def _get_os_details(self):
         """Gathers basic OS and Python environment information using standard libraries."""
         self.hw_info["os"]["platform"] = platform.system()
@@ -85,7 +78,7 @@ class HardwareInspector:
             "logical_cores": None,
             "instruction_sets": None
         }
-        cpuinfo = self._safe_import("cpuinfo")
+        cpuinfo = safe_import("cpuinfo")
         if cpuinfo:
             try:
                 info = cpuinfo.get_cpu_info()
@@ -107,7 +100,7 @@ class HardwareInspector:
                 # print(f"Warning: Could not get CPU details from py-cpuinfo: {e}", file=sys.stderr)
                 cpu_data["brand_raw"] = platform.processor() # Fallback for basic name
 
-        psutil = self._safe_import("psutil")
+        psutil = safe_import("psutil")
         if psutil:
             try:
                 cpu_data["logical_cores"] = psutil.cpu_count(logical=True)
@@ -119,45 +112,62 @@ class HardwareInspector:
         self.hw_info["cpu"] = cpu_data
 
     def _get_ram_details(self):
-        """Gathers RAM total size and available RAM."""
+        """Gathers RAM total size and available RAM with platform-specific details."""
         ram_data = {
             "total_gb": None,
             "available_gb": None,
             "details": None
         }
         
-        if self.hw_info["os"]["platform"] == "Darwin":
+        platform = self.hw_info["os"]["platform"]
+        
+        if platform == "Darwin":
             # macOS: Use accurate Mach kernel API
             try:
                 ram_data = get_macos_memory_stats()
-            except (OSError, AttributeError) as e:
-                # Fallback to psutil if Mach API fails (OSError from syscall failures)
-                psutil = self._safe_import("psutil")
-                if psutil:
-                    try:
-                        mem = psutil.virtual_memory()
-                        ram_data = {
-                            "total_gb": round(mem.total / (1024**3), 2),
-                            "available_gb": round(mem.available / (1024**3), 2),
-                            "details": None
-                        }
-                    except Exception:
-                        pass  # Keep default None values
+            except (OSError, AttributeError):
+                # Fallback to psutil if Mach API fails
+                ram_data = self._get_psutil_memory()
+                
+        elif platform == "Linux":
+            # Linux: Use /proc/meminfo for detailed breakdown
+            try:
+                ram_data = get_linux_memory_stats()
+            except (FileNotFoundError, PermissionError):
+                # Fallback to psutil if /proc/meminfo is not accessible
+                ram_data = self._get_psutil_memory()
+                
+        elif platform == "Windows":
+            # Windows: Use Win32 API for Standby List breakdown
+            try:
+                ram_data = get_windows_memory_stats()
+            except (OSError, AttributeError):
+                # Fallback to psutil if Win32 API fails
+                ram_data = self._get_psutil_memory()
         else:
-            # Linux/Windows: Use psutil
-            psutil = self._safe_import("psutil")
-            if psutil:
-                try:
-                    mem = psutil.virtual_memory()
-                    ram_data = {
-                        "total_gb": round(mem.total / (1024**3), 2),
-                        "available_gb": round(mem.available / (1024**3), 2),
-                        "details": None
-                    }
-                except Exception:
-                    pass  # Keep default None values
+            # Unknown platform: Use psutil
+            ram_data = self._get_psutil_memory()
         
         self.hw_info["ram"] = ram_data
+    
+    def _get_psutil_memory(self):
+        """Fallback memory detection using psutil."""
+        psutil = safe_import("psutil")
+        if psutil:
+            try:
+                mem = psutil.virtual_memory()
+                return {
+                    "total_gb": round(mem.total / (1024**3), 2),
+                    "available_gb": round(mem.available / (1024**3), 2),
+                    "details": None
+                }
+            except Exception:
+                pass
+        return {
+            "total_gb": None,
+            "available_gb": None,
+            "details": None
+        }
 
     def _get_storage_details(self):
         """
@@ -185,7 +195,7 @@ class HardwareInspector:
                                     storage_data["primary_type"] = "HDD"
                                 break # Found the first plausible primary disk
             elif system == "Windows":
-                wmi = self._safe_import("wmi")
+                wmi = safe_import("wmi")
                 if wmi:
                     c = wmi.WMI(namespace="root/Microsoft/Windows/Storage")
                     # MediaType: 3=HDD, 4=SSD, 5=SCM, 0=Unspecified
@@ -197,37 +207,22 @@ class HardwareInspector:
                         else:
                             storage_data["primary_type"] = "Unknown"
                         break # Check first physical disk
-            elif system == "Darwin": # macOS
+            elif system == "Darwin":  # macOS
                 # Use PyObjC to query IOKit
-                Foundation = self._safe_import("Foundation")
-                if Foundation:
+                iokit = load_iokit_functions()
+                if iokit:
                     try:
-                        IOKit = Foundation.NSBundle.bundleWithIdentifier_('com.apple.framework.IOKit')
-                        # Load necessary functions
-                        functions = [
-                            b"IOServiceMatching",
-                            b"IOServiceGetMatchingServices",
-                            b"IOIteratorNext",
-                            b"IOObjectRelease",
-                            b"IORegistryEntryCreateCFProperties"
-                        ]
-                        # Use a dictionary to load functions if `loadFunctions` is used directly, or access via `objc.currentBundle()`
-                        # Modern pyobjc often exposes these directly via 'from IOKit import ...'
-                        try: # Try direct import from IOKit
-                            from IOKit import IOServiceMatching, IOServiceGetMatchingServices, IOIteratorNext, IOObjectRelease, IORegistryEntryCreateCFProperties
-                        except ImportError: # Fallback for older pyobjc or if not directly exposed
-                            _ = IOKit.loadFunctions(functions, globals()) # globals() will load them into global namespace
-                            from IOKit import IOServiceMatching, IOServiceGetMatchingServices, IOIteratorNext, IOObjectRelease, IORegistryEntryCreateCFProperties
+                        IOServiceMatching, IOServiceGetMatchingServices, IOIteratorNext, IOObjectRelease, IORegistryEntryCreateCFProperties = iokit
 
                         matching_dict = IOServiceMatching(b"IOBlockStorageDevice")
-                        iterator = IOServiceGetMatchingServices(0, matching_dict) # 0 for kIOMasterPortDefault
+                        iterator = IOServiceGetMatchingServices(0, matching_dict)  # 0 for kIOMasterPortDefault
                         
                         if iterator:
                             while (drive := IOIteratorNext(iterator)):
                                 # Get properties of the drive
                                 err, properties = IORegistryEntryCreateCFProperties(drive, None, None, 0)
                                 if properties:
-                                    if properties.get("Solid State"): # kIOPropertySolidStateKey
+                                    if properties.get("Solid State"):  # kIOPropertySolidStateKey
                                         storage_data["primary_type"] = "SSD/NVMe"
                                         IOObjectRelease(drive)
                                         break
@@ -237,8 +232,7 @@ class HardwareInspector:
                                         break
                                 IOObjectRelease(drive)
                             IOObjectRelease(iterator)
-                    except Exception as e:
-                        # print(f"Warning: Failed to get macOS storage info via IOKit: {e}", file=sys.stderr)
+                    except Exception:
                         pass
         except Exception as e:
             # print(f"Warning: Could not infer storage type: {e}", file=sys.stderr)
@@ -249,7 +243,7 @@ class HardwareInspector:
     def _get_vulkan_version(self):
         """Gets Vulkan API version using the official vulkan library."""
         vulkan_api_version = None
-        vulkan = self._safe_import("vulkan")
+        vulkan = safe_import("vulkan")
         if vulkan:
             try:
                 from ctypes import byref, c_uint32
@@ -270,7 +264,7 @@ class HardwareInspector:
     def _get_nvidia_gpus(self):
         """Gathers NVIDIA GPU details using pynvml."""
         nvidia_gpus_list = []
-        pynvml = self._safe_import("pynvml.nvml")
+        pynvml = safe_import("pynvml.nvml")
         if pynvml:
             try:
                 pynvml.nvmlInit()
@@ -313,14 +307,26 @@ class HardwareInspector:
                             matched_cores_cc = core_lookup[key]
                             break
 
+                    # Get ECC status (important for data center GPUs - reduces usable VRAM by 6-12%)
+                    ecc_enabled = None
+                    try:
+                        ecc_mode = pynvml.nvmlDeviceGetEccMode(handle)
+                        # ecc_mode.current is NVML_FEATURE_ENABLED (1) or NVML_FEATURE_DISABLED (0)
+                        ecc_enabled = (ecc_mode.current == 1)
+                    except (AttributeError, pynvml.NVMLError):
+                        # ECC not supported on consumer GPUs, that's expected
+                        pass
+
                     gpu_info = {
                         "model": name,
                         "vram_gb": round(mem_info.total / (1024**3), 2),
+                        "available_vram_gb": round(mem_info.free / (1024**3), 2),
                         "driver_version": driver_version,
                         "cuda_version": cuda_version,
                         "compute_capability": matched_cores_cc.get("compute_cap") if matched_cores_cc else None,
                         "cuda_cores": matched_cores_cc.get("cuda") if matched_cores_cc else None,
-                        "tensor_cores": matched_cores_cc.get("tensor") if matched_cores_cc else None
+                        "tensor_cores": matched_cores_cc.get("tensor") if matched_cores_cc else None,
+                        "ecc_enabled": ecc_enabled
                     }
                     nvidia_gpus_list.append(gpu_info)
                     
@@ -337,6 +343,41 @@ class HardwareInspector:
                 # print(f"Warning: Unexpected error during NVIDIA GPU detection: {e}", file=sys.stderr)
                 pass
 
+    def _get_amd_gtt_info(self):
+        """
+        Read GTT (Graphics Translation Table) info from sysfs on Linux.
+        
+        GTT is the system RAM accessible to the GPU on AMD APUs. On discrete GPUs,
+        GTT is typically small or zero. On APUs, GTT is how the GPU accesses the
+        bulk of system RAM beyond the small dedicated VRAM aperture.
+        
+        Returns:
+            Tuple of (gtt_total_gb, gtt_used_gb) or (None, None) if not available
+        """
+        gtt_total_gb, gtt_used_gb = None, None
+        
+        if self.hw_info["os"]["platform"] != "Linux":
+            return gtt_total_gb, gtt_used_gb
+            
+        try:
+            drm_path = '/sys/class/drm/'
+            for card in sorted(os.listdir(drm_path)):
+                if card.startswith('card') and card[4:].isdigit():
+                    device_path = os.path.join(drm_path, card, 'device')
+                    gtt_total_path = os.path.join(device_path, 'mem_info_gtt_total')
+                    gtt_used_path = os.path.join(device_path, 'mem_info_gtt_used')
+                    
+                    if os.path.exists(gtt_total_path):
+                        with open(gtt_total_path, 'r') as f:
+                            gtt_total_gb = int(f.read().strip()) / (1024**3)
+                        with open(gtt_used_path, 'r') as f:
+                            gtt_used_gb = int(f.read().strip()) / (1024**3)
+                        break  # Found first AMD device with GTT info
+        except (FileNotFoundError, PermissionError, ValueError):
+            pass
+            
+        return gtt_total_gb, gtt_used_gb
+
     def _get_amd_gpus(self):
         """Gathers AMD GPU details and checks for ROCm compatibility using amdsmi."""
         # Skip AMD detection on macOS as it doesn't have AMD GPUs
@@ -344,7 +385,7 @@ class HardwareInspector:
             return
             
         amd_gpus_list = []
-        amdsmi = self._safe_import("amdsmi")
+        amdsmi = safe_import("amdsmi")
         if amdsmi:
             try:
                 amdsmi.amdsmi_init()
@@ -356,6 +397,12 @@ class HardwareInspector:
 
                 driver_version_info = amdsmi.amdsmi_get_driver_info()
                 driver_version = driver_version_info.get('driver_version') if driver_version_info else None
+                
+                # Get GTT info from sysfs (for APU detection)
+                gtt_total_gb, gtt_used_gb = self._get_amd_gtt_info()
+                
+                # Get system RAM for APU detection heuristic
+                system_ram_gb = self.hw_info.get("ram", {}).get("total_gb") or 0
 
                 for dev_handle in devices:
                     gpu_info = {}
@@ -364,16 +411,30 @@ class HardwareInspector:
                         vram_info = amdsmi.amdsmi_get_gpu_vram_info(dev_handle)
                         asic_info = amdsmi.amdsmi_get_gpu_asic_info(dev_handle)
                         
-                        gpu_info["model"] = name.decode('utf-8') if name else None
-                        gpu_info["vram_gb"] = round(vram_info.get('vram_total', 0) / (1024**3), 2) if vram_info else None
+                        vram_total_gb = round(vram_info.get('vram_total', 0) / (1024**3), 2) if vram_info else None
+                        vram_used_gb = round(vram_info.get('vram_used', 0) / (1024**3), 2) if vram_info else None
+                        available_vram_gb = round(vram_total_gb - vram_used_gb, 2) if vram_total_gb and vram_used_gb else None
+                        
+                        # APU detection: if VRAM < 5% of system RAM, it's likely an APU
+                        # APUs have small dedicated VRAM (512MB - 2GB) but access system RAM via GTT
+                        is_apu = None
+                        if vram_total_gb and system_ram_gb > 0:
+                            is_apu = (vram_total_gb / system_ram_gb) < 0.05
+                        
+                        gpu_info["model"] = name.decode('utf-8') if isinstance(name, bytes) else name
+                        gpu_info["vram_gb"] = vram_total_gb
+                        gpu_info["available_vram_gb"] = available_vram_gb
                         gpu_info["driver_version"] = driver_version
-                        gpu_info["rocm_compatible"] = True # If amdsmi works, ROCm is compatible
+                        gpu_info["rocm_compatible"] = True  # If amdsmi works, ROCm is compatible
                         gpu_info["compute_units"] = asic_info.get('num_of_compute_units') if asic_info else None
+                        gpu_info["is_apu"] = is_apu
+                        gpu_info["gtt_total_gb"] = round(gtt_total_gb, 2) if gtt_total_gb else None
+                        gpu_info["gtt_used_gb"] = round(gtt_used_gb, 2) if gtt_used_gb else None
 
                         amd_gpus_list.append(gpu_info)
                     except amdsmi.AmdSmiException:
                         # print(f"Warning: AMD SMI exception for device handle: {e}", file=sys.stderr)
-                        continue # Skip device if specific queries fail
+                        continue  # Skip device if specific queries fail
                 
                 amdsmi.amdsmi_shut_down()
                 
@@ -385,14 +446,74 @@ class HardwareInspector:
                 # print(f"Info: AMD amdsmi library failed. No ROCm GPU detected. {e}", file=sys.stderr)
                 pass # Fail silently if amdsmi fails or ROCm not installed
 
+    def _get_intel_driver_type(self):
+        """
+        Detect Linux Intel GPU driver type (i915 vs xe).
+        
+        The xe driver (newer) may have different memory limits than i915.
+        
+        Returns:
+            'i915', 'xe', or None if not on Linux or not detectable
+        """
+        if self.hw_info["os"]["platform"] != "Linux":
+            return None
+            
+        try:
+            # Check which driver module is loaded
+            with open('/proc/modules', 'r') as f:
+                modules = f.read()
+                if 'xe ' in modules:  # xe driver (space to avoid partial match)
+                    return 'xe'
+                elif 'i915 ' in modules:
+                    return 'i915'
+        except (FileNotFoundError, PermissionError):
+            pass
+            
+        return None
+    
+    def _get_intel_shared_memory_limit(self):
+        """
+        Get the WDDM shared memory limit for Intel iGPU on Windows.
+        
+        Uses DXGI to query the actual SharedSystemMemory limit. By default,
+        Windows caps iGPU shared memory at 50% of system RAM, but newer
+        drivers (32.0.101.6987+) on Core Ultra allow users to override this
+        via "Shared GPU Memory Override" in Intel Graphics Command Center.
+        
+        Returns:
+            Shared memory limit in GB, or None if not on Windows or not detectable
+        """
+        if self.hw_info["os"]["platform"] != "Windows":
+            return None
+        
+        # Try to query DXGI for the actual limit
+        limit_gb = get_intel_shared_memory_limit_gb()
+        if limit_gb is not None:
+            return limit_gb
+        
+        # Fallback: Calculate based on 50% system RAM (default WDDM behavior)
+        system_ram_gb = self.hw_info.get("ram", {}).get("total_gb")
+        if system_ram_gb:
+            return round(system_ram_gb / 2, 2)  # 50% cap
+        
+        return None
+
     def _get_intel_accelerators(self):
         """Gathers Intel GPU and NPU details using OpenVINO."""
         intel_devices_list = []
-        ov = self._safe_import("openvino")
+        ov = safe_import("openvino")
         if ov:
             try:
                 core = ov.Core()
                 available_devices = core.available_devices
+                
+                # Get driver type for Linux
+                driver_type = self._get_intel_driver_type()
+                
+                # Get shared memory limit for Windows iGPU
+                shared_memory_limit = None
+                if self.hw_info["os"]["platform"] == "Windows":
+                    shared_memory_limit = self._get_intel_shared_memory_limit()
                 
                 for device in available_devices:
                     if "GPU" in device or "NPU" in device:
@@ -402,16 +523,23 @@ class HardwareInspector:
                         accel_info["model"] = name
 
                         if "GPU" in device:
-                            accel_info["type"] = "dGPU" if ".1" in device else "iGPU"
+                            is_dgpu = ".1" in device
+                            accel_info["type"] = "dGPU" if is_dgpu else "iGPU"
                             accel_info["execution_units"] = core.get_property(device, "GPU_EXECUTION_UNITS_COUNT")
                             # VRAM for Intel GPUs might be shared or dedicated
                             accel_info["vram_gb"] = round(core.get_property(device, "GPU_MEMORY_SIZE") / (1024**3), 2)
-                            accel_info["driver_version"] = core.get_property(device, "GPU_DRIVER_VERSION") # Pure API
-                        else: # NPU
+                            accel_info["driver_version"] = core.get_property(device, "GPU_DRIVER_VERSION")
+                            
+                            # Add new quirk detection fields
+                            accel_info["driver_type"] = driver_type if not is_dgpu else None  # Only for iGPU
+                            accel_info["shared_memory_limit_gb"] = shared_memory_limit if not is_dgpu else None
+                        else:  # NPU
                             accel_info["type"] = "NPU"
-                            accel_info["execution_units"] = None # N/A for NPU
-                            accel_info["vram_gb"] = None # NPU uses system RAM directly
-                            accel_info["driver_version"] = None # Not easily exposed for NPU
+                            accel_info["execution_units"] = None  # N/A for NPU
+                            accel_info["vram_gb"] = None  # NPU uses system RAM directly
+                            accel_info["driver_version"] = None  # Not easily exposed for NPU
+                            accel_info["driver_type"] = None
+                            accel_info["shared_memory_limit_gb"] = None
 
                         intel_devices_list.append(accel_info)
 
@@ -422,10 +550,10 @@ class HardwareInspector:
                     if any(dev.get("type") == "NPU" for dev in intel_devices_list):
                         self.hw_info["npus"].append({
                             "vendor": "Intel",
-                            "model_name": "Intel AI Boost" # Generic name for now
+                            "model_name": "Intel AI Boost"  # Generic name for now
                         })
 
-            except (RuntimeError, Exception): # RuntimeError if device properties are missing
+            except (RuntimeError, Exception):  # RuntimeError if device properties are missing
                 # print(f"Info: OpenVINO failed to query Intel accelerator details. {e}", file=sys.stderr)
                 pass
 
@@ -446,7 +574,7 @@ class HardwareInspector:
             }
             
             # Check for Metal availability via MLX and PyTorch
-            mlx_metal = self._safe_import("mlx.core.metal")
+            mlx_metal = safe_import("mlx.core.metal")
             if mlx_metal and mlx_metal.is_available():
                 apple_gpu_info["metal_supported"] = True
                 device_info = mlx_metal.device_info()
@@ -454,27 +582,16 @@ class HardwareInspector:
                 apple_gpu_info["vram_gb"] = round(device_info.get('memory_size', 0) / (1024**3), 2) # Total unified memory
 
             if not apple_gpu_info["metal_supported"]: # Fallback to PyTorch MPS if MLX not found
-                torch = self._safe_import("torch")
+                torch = safe_import("torch")
                 if torch and torch.backends.mps.is_available():
                     apple_gpu_info["metal_supported"] = True
                     # MPS doesn't give specific model/memory like MLX, so rely on OS data later if needed
 
             # Use PyObjC to query IOKit for more granular (but fragile) details
-            Foundation = self._safe_import("Foundation")
-            if Foundation:
+            iokit = load_iokit_functions()
+            if iokit:
                 try:
-                    # IOKit bridge setup (similar to Storage, ensures functions are loaded)
-                    IOKit_bundle = Foundation.NSBundle.bundleWithIdentifier_('com.apple.framework.IOKit')
-                    try:
-                        from IOKit import IOServiceMatching, IOServiceGetMatchingServices, IOIteratorNext, IOObjectRelease, IORegistryEntryCreateCFProperties
-                    except ImportError:
-                        # Fallback for older pyobjc or if not directly exposed
-                        functions = [
-                            b"IOServiceMatching", b"IOServiceGetMatchingServices", b"IOIteratorNext",
-                            b"IOObjectRelease", b"IORegistryEntryCreateCFProperties"
-                        ]
-                        _ = IOKit_bundle.loadFunctions(functions, globals())
-
+                    IOServiceMatching, IOServiceGetMatchingServices, IOIteratorNext, IOObjectRelease, IORegistryEntryCreateCFProperties = iokit
 
                     # --- GPU Cores ---
                     matching = IOServiceMatching(b"AGXAccelerator")

@@ -29,12 +29,14 @@ Complete API documentation for EdgeKit, organized by module.
   - [Functions](#models-functions)
     - [`model_preflight()`](#model_preflight)
     - [`can_load()`](#can_load)
+    - [`inspect_model_remote()`](#inspect_model_remote)
   - [Schemas](#models-schemas)
     - [`PreflightResult`](#preflightresult)
     - [`PreflightStatus`](#preflightstatus)
     - [`Engine`](#engine)
     - [`MemoryEstimate`](#memoryestimate)
     - [`ModelMetadata`](#modelmetadata)
+    - [`RemoteInspectError`](#remoteinspecterror)
 - [Module: `edgekit.build`](#module-edgekitbuild)
   - [Functions](#build-functions)
     - [`llama_cpp_args()`](#llama_cpp_args)
@@ -233,11 +235,13 @@ NVIDIA GPU information.
 |-------|------|-------------|
 | `model` | `str` | GPU model name ("RTX 4090", "A100") |
 | `vram_gb` | `float` | VRAM size in gigabytes |
+| `available_vram_gb` | `float \| None` | Currently available VRAM in gigabytes |
 | `driver_version` | `str` | NVIDIA driver version |
 | `cuda_version` | `str \| None` | CUDA version supported by driver |
 | `compute_capability` | `float \| None` | Compute capability (e.g., 8.9 for RTX 4090) |
 | `cuda_cores` | `int \| None` | Number of CUDA cores |
 | `tensor_cores` | `int \| None` | Number of Tensor cores |
+| `ecc_enabled` | `bool \| None` | Whether ECC memory is enabled (reduces usable VRAM by 6-12% on data center GPUs) |
 
 ---
 
@@ -251,9 +255,13 @@ AMD GPU information.
 |-------|------|-------------|
 | `model` | `str \| None` | GPU model name |
 | `vram_gb` | `float \| None` | VRAM size in gigabytes |
+| `available_vram_gb` | `float \| None` | Currently available VRAM in gigabytes |
 | `driver_version` | `str \| None` | AMD driver version |
 | `rocm_compatible` | `bool` | Whether GPU is ROCm compatible |
 | `compute_units` | `int \| None` | Number of compute units |
+| `is_apu` | `bool \| None` | Whether this is an APU (integrated) vs discrete GPU |
+| `gtt_total_gb` | `float \| None` | GTT (Graphics Translation Table) total size - system RAM accessible to GPU on APUs |
+| `gtt_used_gb` | `float \| None` | GTT memory currently in use |
 
 ---
 
@@ -375,7 +383,9 @@ def model_preflight(
 
 **Description:**
 
-Validates whether a model will fit in memory before loading. Automatically downloads/caches HuggingFace models if needed. Inspects GGUF files or HuggingFace configs to extract model architecture, calculates memory requirements (weights + KV cache + overhead), and determines the maximum safe context window.
+Validates whether a model will fit in memory before loading. For HuggingFace repository IDs, first attempts **lightweight remote inspection** using HTTP Range requests (~500KB bandwidth) to extract metadata without downloading the full model. If remote inspection fails, falls back to downloading the model.
+
+The function inspects GGUF files or HuggingFace configs to extract model architecture, calculates memory requirements (weights + KV cache + overhead), and determines the maximum safe context window.
 
 The function uses model-specific memory estimation for each backend:
 - **MLX**: Checks macOS unified memory
@@ -449,6 +459,56 @@ if can_load("mlx-community/Llama-3-8B-4bit", engine="mlx"):
     model, tokenizer = load("mlx-community/Llama-3-8B-4bit")
 else:
     print("Model won't fit, choose a smaller one")
+```
+
+---
+
+#### `inspect_model_remote()`
+
+Extract model metadata from a remote HuggingFace repository without downloading the full model.
+
+**Signature:**
+```python
+def inspect_model_remote(
+    repo_id: str,
+    engine: Engine
+) -> ModelMetadata
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `repo_id` | `str` | HuggingFace repository ID (e.g., "meta-llama/Llama-3-8B") |
+| `engine` | [`Engine`](#engine) | Inference engine - `"mlx"`, `"llama_cpp"`, or `"vllm"` |
+
+**Returns:**
+- [`ModelMetadata`](#modelmetadata) - Extracted model metadata
+
+**Raises:**
+- [`RemoteInspectError`](#remoteinspecterror) - If remote inspection fails (authentication required, network error, unsupported format)
+
+**Description:**
+
+Performs lightweight remote inspection using HTTP Range requests. Fetches only the metadata needed for memory estimation:
+- **GGUF models**: ~512KB (binary header + KV block)
+- **Safetensors models**: ~50KB (config.json + tensor header)
+- **MLX models**: ~5KB (config.json only)
+
+This is an advanced function—most users should use `model_preflight()` which calls this internally and handles fallback to full download.
+
+**Example:**
+```python
+from edgekit.models import inspect_model_remote, RemoteInspectError
+
+try:
+    metadata = inspect_model_remote("TheBloke/Llama-2-7B-GGUF", engine="llama_cpp")
+    print(f"Layers: {metadata.num_layers}")
+    print(f"KV heads: {metadata.num_kv_heads}")
+    print(f"Quantization: {metadata.quantization_type}")
+except RemoteInspectError as e:
+    print(f"Remote inspection failed: {e}")
+    # Fall back to downloading the model
 ```
 
 ---
@@ -591,11 +651,42 @@ Comprehensive model metadata for memory estimation.
 | `is_moe` | `bool` | Whether model is Mixture of Experts |
 | `num_experts` | `int \| None` | Number of experts (MoE models) |
 | `is_multimodal` | `bool` | Whether model is multimodal |
+| `kv_lora_rank` | `int \| None` | DeepSeek MLA compressed KV dimension (90%+ KV cache reduction) |
 | `raw_config` | `Dict[str, Any]` | Raw configuration dictionary |
 
 **Description:**
 
 Extracted from GGUF binary headers or HuggingFace config.json files. Used for accurate memory estimation. This is typically not accessed directly by users—it's an internal detail of `model_preflight()`.
+
+Note: The `kv_lora_rank` field is specific to DeepSeek V2/V3 models which use Multi-Head Latent Attention (MLA) to drastically reduce KV cache memory requirements.
+
+---
+
+#### `RemoteInspectError`
+
+Exception raised when remote inspection fails.
+
+**Description:**
+
+This exception signals that the lightweight HTTP Range-based inspection could not complete. The caller should fall back to downloading the full model for local inspection.
+
+**Common causes:**
+- Authentication required for gated models (401/403)
+- Private repository without access
+- Non-standard repository structure
+- Network errors or timeouts
+- Unsupported model format
+
+**Example:**
+```python
+from edgekit.models import inspect_model_remote, RemoteInspectError
+
+try:
+    metadata = inspect_model_remote("meta-llama/Llama-3-70B", engine="vllm")
+except RemoteInspectError as e:
+    print(f"Light inspection failed: {e}")
+    # Fall back to full download
+```
 
 ---
 

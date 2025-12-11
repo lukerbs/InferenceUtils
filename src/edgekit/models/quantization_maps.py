@@ -50,10 +50,13 @@ GGUF_BPW_MAP = {
 
 # MLX quantization types to Bits-Per-Weight
 # MLX uses group-wise quantization with FP16 scales
+# BPW values validated by research: payload + metadata overhead
+# Example: 4-bit group-64 = (64×4 + 32) / 64 = 4.50 BPW
 MLX_BPW_MAP = {
     "2bit": 2.25,
     "3bit": 3.75,
-    "4bit": 4.25,  # Group size 32/64 with FP16 scales
+    "4bit": 4.50,      # Group size 64 (default): validated 4.50 BPW
+    "4bit_g32": 5.00,  # Group size 32 (high quality): 5.00 BPW
     "8bit": 8.25,
     "fp16": 16.0,
     "bf16": 16.0,
@@ -94,7 +97,7 @@ def get_mlx_bpw(quant_type: str) -> float:
         quant_type: MLX quantization type string (e.g., "4bit")
         
     Returns:
-        Bits per weight (e.g., 4.25 for 4bit)
+        Bits per weight (e.g., 4.50 for 4bit)
     """
     quant_lower = quant_type.lower().strip()
     
@@ -114,6 +117,44 @@ def get_mlx_bpw(quant_type: str) -> float:
     
     # Default to FP16 if unknown (conservative)
     return 16.0
+
+
+def get_mlx_bpw_for_group_size(bits: int, group_size: int = 64) -> float:
+    """
+    Get Bits-Per-Weight for MLX quantization with specific group size.
+    
+    MLX uses affine quantization where each group of weights shares
+    a scale (FP16) and bias (FP16). Smaller groups = better quality
+    but higher overhead.
+    
+    Formula: (group_size × bits + 32) / group_size
+    - 32 bits = 16-bit scale + 16-bit bias per group
+    
+    Args:
+        bits: Quantization bits (2, 3, 4, or 8)
+        group_size: Number of weights per group (32, 64, or 128)
+        
+    Returns:
+        Effective bits per weight
+        
+    Examples:
+        >>> get_mlx_bpw_for_group_size(4, 64)  # Default
+        4.5
+        >>> get_mlx_bpw_for_group_size(4, 32)  # High quality
+        5.0
+    """
+    # Special cases from lookup table
+    if bits == 4 and group_size == 32:
+        return MLX_BPW_MAP["4bit_g32"]
+    if bits == 4 and group_size == 64:
+        return MLX_BPW_MAP["4bit"]
+    
+    # Calculate from formula for other cases
+    # Overhead = 32 bits (FP16 scale + FP16 bias) per group
+    metadata_bits = 32
+    effective_bpw = (group_size * bits + metadata_bits) / group_size
+    
+    return effective_bpw
 
 
 def parse_quantization_from_filename(filename: str) -> Tuple[Optional[str], float]:

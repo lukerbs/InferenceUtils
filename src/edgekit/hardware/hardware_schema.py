@@ -40,11 +40,33 @@ class MacOSMemoryDetails(BaseModel):
     page_size_bytes: int = Field(description="Hardware page size (16384 on Apple Silicon, 4096 on Intel)")
 
 
+class WindowsMemoryDetails(BaseModel):
+    """Windows-specific memory breakdown via Win32 API (Standby List)."""
+    standby_gb: Optional[float] = Field(None, description="Standby list memory (reclaimable cache, similar to macOS cached files)")
+    modified_gb: Optional[float] = Field(None, description="Modified pages pending write to disk")
+    free_gb: Optional[float] = Field(None, description="Truly free (zeroed) pages")
+    cached_gb: Optional[float] = Field(None, description="Total cached memory (standby + modified)")
+    commit_total_gb: Optional[float] = Field(None, description="Total committed memory (physical + page file)")
+    commit_limit_gb: Optional[float] = Field(None, description="Maximum commit limit")
+
+
+class LinuxMemoryDetails(BaseModel):
+    """Linux-specific memory breakdown from /proc/meminfo."""
+    mem_free_gb: float = Field(description="MemFree - completely unused RAM")
+    buffers_gb: float = Field(description="Kernel buffer cache")
+    cached_gb: float = Field(description="Page cache (file-backed, reclaimable)")
+    sreclaimable_gb: float = Field(description="Slab reclaimable memory (kernel caches)")
+    swap_total_gb: Optional[float] = Field(None, description="Total swap space")
+    swap_free_gb: Optional[float] = Field(None, description="Free swap space")
+
+
 class RAM(BaseModel):
     """Random Access Memory information."""
     total_gb: Optional[float] = Field(None, description="Total RAM in gigabytes")
     available_gb: Optional[float] = Field(None, description="Available RAM in gigabytes")
-    details: Optional[MacOSMemoryDetails] = Field(None, description="Platform-specific memory details")
+    details: Optional[Union[MacOSMemoryDetails, WindowsMemoryDetails, LinuxMemoryDetails]] = Field(
+        None, description="Platform-specific memory details (one populated based on OS)"
+    )
 
 
 class Storage(BaseModel):
@@ -55,21 +77,27 @@ class Storage(BaseModel):
 class NVIDIAGPU(BaseModel):
     """NVIDIA GPU information."""
     model: str = Field(..., description="GPU model name")
-    vram_gb: float = Field(..., description="VRAM size in gigabytes")
+    vram_gb: float = Field(..., description="Total VRAM size in gigabytes")
+    available_vram_gb: Optional[float] = Field(None, description="Currently available VRAM in gigabytes")
     driver_version: str = Field(..., description="NVIDIA driver version")
     cuda_version: Optional[str] = Field(None, description="CUDA version supported by driver")
     compute_capability: Optional[float] = Field(None, description="Compute capability (e.g., 8.9 for RTX 4090)")
     cuda_cores: Optional[int] = Field(None, description="Number of CUDA cores")
     tensor_cores: Optional[int] = Field(None, description="Number of Tensor cores")
+    ecc_enabled: Optional[bool] = Field(None, description="Whether ECC memory is enabled (reduces usable VRAM by 6-12% on data center GPUs)")
 
 
 class AMDGPU(BaseModel):
     """AMD GPU information."""
     model: Optional[str] = Field(None, description="GPU model name")
-    vram_gb: Optional[float] = Field(None, description="VRAM size in gigabytes")
+    vram_gb: Optional[float] = Field(None, description="Dedicated VRAM size in gigabytes")
+    available_vram_gb: Optional[float] = Field(None, description="Currently available VRAM in gigabytes")
     driver_version: Optional[str] = Field(None, description="AMD driver version")
     rocm_compatible: bool = Field(..., description="Whether GPU is ROCm compatible")
     compute_units: Optional[int] = Field(None, description="Number of compute units")
+    is_apu: Optional[bool] = Field(None, description="Whether this is an APU (integrated) vs discrete GPU")
+    gtt_total_gb: Optional[float] = Field(None, description="GTT (Graphics Translation Table) total size - system RAM accessible to GPU on APUs")
+    gtt_used_gb: Optional[float] = Field(None, description="GTT currently in use")
 
 
 class IntelAccelerator(BaseModel):
@@ -79,6 +107,8 @@ class IntelAccelerator(BaseModel):
     execution_units: Optional[int] = Field(None, description="Number of execution units (GPU only)")
     vram_gb: Optional[float] = Field(None, description="VRAM size in gigabytes (GPU only)")
     driver_version: Optional[str] = Field(None, description="Driver version (GPU only)")
+    shared_memory_limit_gb: Optional[float] = Field(None, description="WDDM shared memory limit for iGPU (may be capped at 50% of system RAM on Windows)")
+    driver_type: Optional[str] = Field(None, description="Linux driver type ('i915' or 'xe') - affects memory limits")
 
 
 class AppleGPU(BaseModel):

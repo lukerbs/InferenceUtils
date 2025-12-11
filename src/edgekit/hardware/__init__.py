@@ -13,7 +13,22 @@ from .hardware_schema import (
     GPU,
     RAM,
     Storage,
+    # Platform-specific memory details
+    MacOSMemoryDetails,
+    WindowsMemoryDetails,
+    LinuxMemoryDetails,
+    # GPU schemas with new quirk fields
+    NVIDIAGPU,
+    AMDGPU,
+    IntelAccelerator,
+    AppleGPU,
 )
+
+# Platform-specific memory detection (for advanced usage)
+# These imports are safe on all platforms - the functions handle platform checks internally
+from .macos_memory import get_macos_memory_stats
+from .linux_memory import get_linux_memory_stats
+from .windows_memory import get_windows_memory_stats
 
 # Backwards compatibility
 systeminfo = system_info
@@ -31,6 +46,22 @@ __all__ = [
     "GPU",
     "RAM",
     "Storage",
+    
+    # Platform-specific memory detail schemas
+    "MacOSMemoryDetails",
+    "WindowsMemoryDetails",
+    "LinuxMemoryDetails",
+    
+    # GPU schemas (with quirk detection fields)
+    "NVIDIAGPU",
+    "AMDGPU",
+    "IntelAccelerator",
+    "AppleGPU",
+    
+    # Platform-specific memory detection functions
+    "get_macos_memory_stats",
+    "get_linux_memory_stats",
+    "get_windows_memory_stats",
     
     # Backwards compatibility
     "systeminfo",

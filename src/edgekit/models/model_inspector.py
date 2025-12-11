@@ -15,11 +15,10 @@ from typing import Optional, Dict, Any
 from gguf import GGUFReader, GGMLQuantizationType
 
 from .quantization_maps import (
-    get_gguf_bpw, 
-    get_mlx_bpw, 
+    get_gguf_bpw,
+    get_mlx_bpw_for_group_size,
     parse_quantization_from_filename,
     parse_quantization_from_model_id,
-    GGUF_BPW_MAP
 )
 
 
@@ -56,8 +55,18 @@ class ModelMetadata:
     num_experts: Optional[int] = None
     is_multimodal: bool = False
     
+    # DeepSeek MLA (Multi-Head Latent Attention) - compressed KV cache
+    # If set, KV cache uses low-rank latent compression (90%+ reduction)
+    kv_lora_rank: Optional[int] = None
+    
     # Additional metadata
     raw_config: Dict[str, Any] = field(default_factory=dict)
+    
+    def __repr__(self) -> str:
+        """Concise representation for debugging."""
+        size_info = f"{self.params_billions:.1f}B" if self.params_billions else "?B"
+        quant_info = self.quantization_type or "fp16"
+        return f"ModelMetadata({self.model_id!r}, {size_info}, {quant_info})"
 
 
 def inspect_gguf_model(gguf_path: str, model_id: str) -> ModelMetadata:
@@ -114,30 +123,40 @@ def inspect_gguf_model(gguf_path: str, model_id: str) -> ModelMetadata:
                     return parts[0]
             return default
         
+        # Get architecture prefix (e.g., "llama", "qwen2", "phi3", "deepseek2")
+        # This is the "Source of Truth" per GGUF spec - all params are namespaced under it
+        arch = get_field('general.architecture') or 'llama'
+        
+        def get_arch_field(suffix: str, default=None):
+            """Get field with architecture prefix, falling back to llama prefix."""
+            # Try architecture-specific key first, then llama as super-architecture fallback
+            return (
+                get_field(f'{arch}.{suffix}') or
+                get_field(f'llama.{suffix}') or  # Many models use llama as super-architecture
+                default
+            )
+        
         # Layers
-        metadata.num_layers = get_field('llama.block_count') or \
-                             get_field('general.block_count')
+        metadata.num_layers = get_arch_field('block_count')
         
         # Attention heads (total)
-        metadata.num_attention_heads = get_field('llama.attention.head_count') or \
-                                       get_field('general.attention.head_count')
+        metadata.num_attention_heads = get_arch_field('attention.head_count')
         
         # KV heads (GQA-aware - critical!)
-        metadata.num_kv_heads = get_field('llama.attention.head_count_kv') or \
-                                get_field('general.attention.head_count_kv') or \
-                                metadata.num_attention_heads  # Fallback to MHA
+        metadata.num_kv_heads = (
+            get_arch_field('attention.head_count_kv') or
+            metadata.num_attention_heads  # Fallback to MHA if not specified
+        )
         
         # Hidden size
-        metadata.hidden_size = get_field('llama.embedding_length') or \
-                               get_field('general.embedding_length')
+        metadata.hidden_size = get_arch_field('embedding_length')
         
         # Calculate head dimension (guard against division by zero)
         if metadata.hidden_size and metadata.num_attention_heads and metadata.num_attention_heads > 0:
             metadata.head_dim = metadata.hidden_size // metadata.num_attention_heads
         
         # Vocab size
-        metadata.vocab_size = get_field('llama.vocab_size') or \
-                              get_field('general.vocab_size')
+        metadata.vocab_size = get_arch_field('vocab_size')
         
         # Context length - search for any key ending with ".context_length"
         context_length = None
@@ -149,11 +168,21 @@ def inspect_gguf_model(gguf_path: str, model_id: str) -> ModelMetadata:
         metadata.base_context_length = context_length
         metadata.model_max_context = metadata.base_context_length
         
-        # MoE detection
-        num_experts = get_field('llama.expert_count')
+        # Sliding window attention (for Mistral, Phi-3, etc.)
+        sliding_window = get_arch_field('attention.sliding_window') or get_arch_field('rope.sliding_window')
+        if sliding_window:
+            metadata.sliding_window = sliding_window
+        
+        # MoE detection (architecture-agnostic)
+        num_experts = get_arch_field('expert_count')
         if num_experts and num_experts > 1:
             metadata.is_moe = True
             metadata.num_experts = num_experts
+        
+        # DeepSeek MLA detection (kv_lora_rank indicates compressed KV cache)
+        kv_lora_rank = get_arch_field('attention.kv_lora_rank')
+        if kv_lora_rank:
+            metadata.kv_lora_rank = kv_lora_rank
         
         # Calculate exact model size by iterating tensors (most accurate)
         if hasattr(reader, 'tensors'):
@@ -323,12 +352,15 @@ def inspect_transformers_model(model_cache_path: str, model_id: str) -> ModelMet
         else:
             metadata.params_billions = _extract_params_from_name(model_id)
         
-        # Quantization detection
-        quant_config = text_config.get('quantization_config')
+        # Quantization detection with group size awareness
+        # Check both nested 'quantization_config' and top-level 'quantization'
+        quant_config = text_config.get('quantization_config') or config.get('quantization', {})
         if quant_config:
             bits = quant_config.get('bits', 16)
+            group_size = quant_config.get('group_size', 64)  # MLX default is 64
             metadata.quantization_type = f"{bits}bit"
-            metadata.bits_per_weight = get_mlx_bpw(f"{bits}bit")
+            # Use group-size-aware BPW calculation for accurate MLX estimation
+            metadata.bits_per_weight = get_mlx_bpw_for_group_size(bits, group_size)
         else:
             # Parse from model ID
             quant_type, bpw = parse_quantization_from_model_id(model_id)

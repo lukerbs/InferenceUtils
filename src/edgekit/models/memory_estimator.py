@@ -11,6 +11,22 @@ from typing import Optional
 from .model_inspector import ModelMetadata
 
 
+# =============================================================================
+# ESTIMATION CONSTANTS
+# =============================================================================
+
+# MoE models keep router/gating at higher precision (Q6_K/Q8_0)
+# This adds ~5% to weight size compared to dense models
+MOE_WEIGHT_OVERHEAD = 1.05
+
+# KV cache dtype options (bytes per element)
+# Use these with calculate_kv_cache_gb() dtype_bytes parameter
+KV_DTYPE_FP16 = 2.0   # Default - full precision cache
+KV_DTYPE_FP8 = 1.0    # Halves KV cache size
+KV_DTYPE_Q8 = 1.0     # 8-bit quantized cache
+KV_DTYPE_Q4 = 0.5     # 4-bit quantized cache (experimental)
+
+
 @dataclass
 class MemoryEstimate:
     """Detailed memory breakdown for a model."""
@@ -31,6 +47,14 @@ class MemoryEstimate:
     # Model info
     params_billions: Optional[float] = None
     quantization: Optional[str] = None
+    
+    def __repr__(self) -> str:
+        """Concise representation for debugging."""
+        return (
+            f"MemoryEstimate(total={self.total_required_gb:.1f}GB, "
+            f"weights={self.weights_gb:.1f}GB, kv={self.kv_cache_gb:.1f}GB, "
+            f"overhead={self.overhead_gb:.1f}GB)"
+        )
 
 
 def get_activation_overhead_gb(
@@ -77,18 +101,20 @@ def calculate_kv_cache_gb(
     num_kv_heads: int,
     head_dim: int,
     context_length: int,
-    dtype_bytes: float = 2.0
+    dtype_bytes: float = 2.0,
+    kv_lora_rank: int = None
 ) -> float:
     """
     Calculate KV cache memory in GB.
     
-    Formula: 2 × layers × kv_heads × head_dim × context × dtype_bytes
+    Standard Formula: 2 × layers × kv_heads × head_dim × context × dtype_bytes
+    MLA Formula: 2 × layers × kv_lora_rank × context × dtype_bytes (DeepSeek)
     
     The factor of 2 accounts for both Keys (K) and Values (V).
     
     IMPORTANT:
     - Use num_kv_heads (GQA-aware), not num_attention_heads!
-    - Use full context_length, ignore sliding window for memory validation
+    - For DeepSeek MLA models, kv_lora_rank compresses KV cache by 90%+
     
     Args:
         num_layers: Number of transformer layers
@@ -96,12 +122,20 @@ def calculate_kv_cache_gb(
         head_dim: Dimension per head (hidden_size / num_attention_heads)
         context_length: Full context length to allocate
         dtype_bytes: Bytes per element (2 for FP16, 1 for FP8/Q8_0, 0.5 for Q4_0)
+        kv_lora_rank: DeepSeek MLA compressed latent dimension (if set, uses MLA formula)
         
     Returns:
         KV cache size in GB
     """
-    # K and V both stored
-    kv_cache_bytes = 2 * num_layers * num_kv_heads * head_dim * context_length * dtype_bytes
+    if kv_lora_rank:
+        # DeepSeek MLA: compressed KV cache using low-rank latent vectors
+        # The compression is massive (90%+ reduction vs standard attention)
+        # Formula uses kv_lora_rank instead of kv_heads * head_dim
+        kv_cache_bytes = 2 * num_layers * kv_lora_rank * context_length * dtype_bytes
+    else:
+        # Standard attention: K and V both stored per head
+        kv_cache_bytes = 2 * num_layers * num_kv_heads * head_dim * context_length * dtype_bytes
+    
     return kv_cache_bytes / (1024**3)
 
 
@@ -113,8 +147,8 @@ def calculate_max_safe_context(
     """
     Calculate maximum safe context length given a memory budget.
     
-    Solves the KV cache formula for context_length:
-    context = budget_bytes / (2 × layers × kv_heads × head_dim × dtype_bytes)
+    Standard: context = budget_bytes / (2 × layers × kv_heads × head_dim × dtype_bytes)
+    MLA: context = budget_bytes / (2 × layers × kv_lora_rank × dtype_bytes)
     
     Args:
         available_budget_gb: Memory budget for KV cache in GB
@@ -124,15 +158,25 @@ def calculate_max_safe_context(
     Returns:
         Maximum safe context length in tokens
     """
-    if not all([metadata.num_layers, metadata.num_kv_heads, metadata.head_dim]):
-        # Cannot calculate, return conservative default
-        return 16384
+    # Check for MLA (DeepSeek) - only need layers and kv_lora_rank
+    kv_lora_rank = getattr(metadata, 'kv_lora_rank', None)
+    
+    if kv_lora_rank:
+        # MLA mode: compressed KV cache
+        if not metadata.num_layers:
+            return 16384
+        # Bytes per token with MLA compression (FP16)
+        bytes_per_token = 2 * metadata.num_layers * kv_lora_rank * 2
+    else:
+        # Standard mode
+        if not all([metadata.num_layers, metadata.num_kv_heads, metadata.head_dim]):
+            # Cannot calculate, return conservative default
+            return 16384
+        # Bytes per token (FP16 cache)
+        bytes_per_token = 2 * metadata.num_layers * metadata.num_kv_heads * metadata.head_dim * 2
     
     # Apply safety margin
     budget_bytes = available_budget_gb * (1024**3) * safety_factor
-    
-    # Bytes per token (FP16 cache)
-    bytes_per_token = 2 * metadata.num_layers * metadata.num_kv_heads * metadata.head_dim * 2
     
     max_tokens = int(budget_bytes / bytes_per_token)
     
@@ -167,14 +211,22 @@ def estimate_llamacpp_memory(
     else:
         weights_gb = 8.0  # Conservative fallback
     
+    # MoE models have router/gating at higher precision
+    if metadata.is_moe:
+        weights_gb *= MOE_WEIGHT_OVERHEAD
+    
     # KV cache: Full context allocation
-    if all([metadata.num_layers, metadata.num_kv_heads, metadata.head_dim]):
+    # Check for MLA (DeepSeek) which uses compressed KV cache
+    kv_lora_rank = getattr(metadata, 'kv_lora_rank', None)
+    
+    if all([metadata.num_layers, metadata.num_kv_heads, metadata.head_dim]) or kv_lora_rank:
         kv_cache_gb = calculate_kv_cache_gb(
             num_layers=metadata.num_layers,
-            num_kv_heads=metadata.num_kv_heads,
-            head_dim=metadata.head_dim,
+            num_kv_heads=metadata.num_kv_heads or 1,
+            head_dim=metadata.head_dim or 128,
             context_length=context_length,
-            dtype_bytes=2.0  # FP16
+            dtype_bytes=2.0,  # FP16
+            kv_lora_rank=kv_lora_rank
         )
     else:
         # Fallback estimation based on model size
@@ -227,14 +279,22 @@ def estimate_mlx_memory(
     else:
         weights_gb = 8.0  # Conservative fallback
     
+    # MoE models have router/gating at higher precision
+    if metadata.is_moe:
+        weights_gb *= MOE_WEIGHT_OVERHEAD
+    
     # KV cache: MLX uses FP16 for cache even with quantized weights
-    if all([metadata.num_layers, metadata.num_kv_heads, metadata.head_dim]):
+    # Check for MLA (DeepSeek) which uses compressed KV cache
+    kv_lora_rank = getattr(metadata, 'kv_lora_rank', None)
+    
+    if all([metadata.num_layers, metadata.num_kv_heads, metadata.head_dim]) or kv_lora_rank:
         kv_cache_gb = calculate_kv_cache_gb(
             num_layers=metadata.num_layers,
-            num_kv_heads=metadata.num_kv_heads,
-            head_dim=metadata.head_dim,
+            num_kv_heads=metadata.num_kv_heads or 1,
+            head_dim=metadata.head_dim or 128,
             context_length=context_length,
-            dtype_bytes=2.0  # FP16 cache
+            dtype_bytes=2.0,  # FP16 cache
+            kv_lora_rank=kv_lora_rank
         )
     else:
         # Fallback estimation
@@ -290,6 +350,10 @@ def estimate_vllm_memory(
         weights_gb = (metadata.params_billions * 1e9 * dtype_bytes) / (1024**3)
     else:
         weights_gb = 16.0  # Conservative fallback
+    
+    # MoE models have router/gating at higher precision
+    if metadata.is_moe:
+        weights_gb *= MOE_WEIGHT_OVERHEAD
     
     # Overhead: Fixed tier + CUDA context
     base_overhead = get_activation_overhead_gb(
