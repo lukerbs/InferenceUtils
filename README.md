@@ -6,26 +6,20 @@ Hardware detection and memory validation for local LLM inference.
 
 ```mermaid
 flowchart TD
-    App["✅ Your Application<br/>Clean, portable, works anywhere"]
-    App --> EdgeKit["🔧 EdgeKit<br/>Hardware Abstraction • Memory Validation • Build Config"]
+    App["<b>Your Application</b>"]
+    EdgeKit["<b>EdgeKit</b>"]
+    Complexity["<b>The Fragmented Landscape</b><br/>macOS • Linux • Windows • NVIDIA • AMD • Intel<br/>GGUF • Safetensors • MLX • llama.cpp • vLLM • TensorRT"]
+    Output["<b>Consistent, Predictable Output</b><br/>HardwareProfile • PreflightResult • CMAKE_ARGS"]
     
-    EdgeKit --> hw
-    EdgeKit --> engines
-    
-    subgraph hw["Hardware & OS APIs"]
-        direction LR
-        macOS["macOS"] ~~~ Linux["Linux"] ~~~ Windows["Windows"] ~~~ NVIDIA["NVIDIA"] ~~~ AMD["AMD"] ~~~ Intel["Intel"]
-    end
-    
-    subgraph engines["Model Formats & Inference Engines"]
-        direction LR
-        GGUF["GGUF"] ~~~ Safetensors["Safetensors"] ~~~ MLX["MLX"] ~~~ llamacpp["llama.cpp"] ~~~ vLLM["vLLM"] ~~~ TensorRT["TensorRT"]
-    end
+    App -->|"system_info( ) / model_preflight( ) / llama_cpp_args( )"| EdgeKit
+    EdgeKit -->|"abstracts"| Complexity
+    Complexity -->|"normalizes to"| Output
+    Output -->|"returns to"| App
     
     style App fill:#d1fae5,stroke:#059669,stroke-width:2px
-    style EdgeKit fill:#dbeafe,stroke:#2563eb,stroke-width:3px
-    style hw fill:#fee2e2,stroke:#dc2626
-    style engines fill:#fef3c7,stroke:#d97706
+    style EdgeKit fill:#3b82f6,stroke:#1d4ed8,stroke-width:3px,color:#fff
+    style Complexity fill:#fef3c7,stroke:#d97706
+    style Output fill:#dbeafe,stroke:#2563eb,stroke-width:2px
 ```
 
 ---
