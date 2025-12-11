@@ -5,32 +5,27 @@ Hardware detection and memory validation for local LLM inference.
 **Multiple devices, one interface.** Build local AI applications that run on M4 Macs, NVIDIA GPUs, AMD laptops, and Intel NPUs — without platform-specific code. Write once, deploy anywhere.
 
 ```mermaid
-flowchart TB
-    subgraph fragmented["THE FRAGMENTED LANDSCAPE"]
-        subgraph platforms["Platforms & Vendors"]
-            macOS["macOS<br/>(Mach kernel)"]
-            Linux["Linux<br/>(/proc)"]
-            Windows["Windows<br/>(WMI)"]
-            NVIDIA["NVIDIA<br/>(NVML)"]
-            AMD["AMD<br/>(amdsmi)"]
-            Intel["Intel<br/>(OpenVINO)"]
-        end
-        subgraph formats["Model Formats & Engines"]
-            GGUF["GGUF<br/>parsing"]
-            Safetensors["Safetensors<br/>headers"]
-            MLX["MLX<br/>config"]
-            llamacpp["llama.cpp"]
-            vLLM["vLLM"]
-            TensorRT["TensorRT-LLM"]
-        end
+flowchart TD
+    App["✅ Your Application<br/>Clean, portable, works anywhere"]
+    App --> EdgeKit["🔧 EdgeKit<br/>Hardware Abstraction • Memory Validation • Build Config"]
+    
+    EdgeKit --> hw
+    EdgeKit --> engines
+    
+    subgraph hw["Hardware & OS APIs"]
+        direction LR
+        macOS["macOS"] ~~~ Linux["Linux"] ~~~ Windows["Windows"] ~~~ NVIDIA["NVIDIA"] ~~~ AMD["AMD"] ~~~ Intel["Intel"]
     end
     
-    fragmented --> EdgeKit["<b>EdgeKit</b><br/>Hardware Abstraction +<br/>Preflight Validation"]
-    EdgeKit --> App["<b>Your Application</b><br/>(clean, portable)"]
+    subgraph engines["Model Formats & Inference Engines"]
+        direction LR
+        GGUF["GGUF"] ~~~ Safetensors["Safetensors"] ~~~ MLX["MLX"] ~~~ llamacpp["llama.cpp"] ~~~ vLLM["vLLM"] ~~~ TensorRT["TensorRT"]
+    end
     
-    style EdgeKit fill:#4a9eff,stroke:#2980b9,color:#fff
-    style App fill:#27ae60,stroke:#1e8449,color:#fff
-    style fragmented fill:#fff3e0,stroke:#e65100
+    style App fill:#d1fae5,stroke:#059669,stroke-width:2px
+    style EdgeKit fill:#dbeafe,stroke:#2563eb,stroke-width:3px
+    style hw fill:#fee2e2,stroke:#dc2626
+    style engines fill:#fef3c7,stroke:#d97706
 ```
 
 ---
