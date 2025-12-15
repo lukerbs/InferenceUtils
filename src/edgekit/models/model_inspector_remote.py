@@ -798,7 +798,7 @@ def inspect_model_remote(repo_id: str, engine: str) -> "ModelMetadata":
     
     Args:
         repo_id: HuggingFace repository ID
-        engine: Inference engine - "llama_cpp", "vllm", or "mlx"
+        engine: Inference engine - "llama_cpp", "vllm", or "mlx_lm"
         
     Returns:
         ModelMetadata with architecture and quantization info
@@ -811,7 +811,7 @@ def inspect_model_remote(repo_id: str, engine: str) -> "ModelMetadata":
             return inspect_gguf_remote(repo_id)
         elif engine == "vllm":
             return inspect_safetensors_remote(repo_id)
-        elif engine == "mlx":
+        elif engine == "mlx_lm":
             return inspect_mlx_remote(repo_id)
         else:
             raise RemoteInspectError(f"Unknown engine: {engine}")

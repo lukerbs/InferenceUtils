@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .model_inspector import ModelMetadata
+from .exceptions import PreflightValidationError
 
 
 # =============================================================================
@@ -25,6 +26,27 @@ KV_DTYPE_FP16 = 2.0   # Default - full precision cache
 KV_DTYPE_FP8 = 1.0    # Halves KV cache size
 KV_DTYPE_Q8 = 1.0     # 8-bit quantized cache
 KV_DTYPE_Q4 = 0.5     # 4-bit quantized cache (experimental)
+
+# Activation overhead tiers (GB) - empirically validated
+OVERHEAD_MOE = 3.0           # MoE routing overhead
+OVERHEAD_SMALL = 1.2         # Small models (<10B params)
+OVERHEAD_MEDIUM = 2.5        # Medium models (10-30B params)
+OVERHEAD_LARGE = 4.0         # Large models (>30B params)
+
+# Model size thresholds (billions of parameters)
+SMALL_MODEL_THRESHOLD = 10   # Below this = small model tier
+MEDIUM_MODEL_THRESHOLD = 30  # Below this (but >= 10) = medium model tier
+
+# Backend-specific multipliers
+MLX_WIRING_MULTIPLIER = 1.15      # MLX graph compilation overhead (+15%)
+VLLM_CUDA_CONTEXT_GB = 0.5        # CUDA/PyTorch/NCCL overhead for vLLM
+
+# Context calculation bounds
+MIN_CONTEXT_BOUND = 16384         # Minimum viable for calculate_max_safe_context
+MAX_CONTEXT_UPPER_BOUND = 131072  # Upper clamp (128K) when model max unknown
+
+# KV cache calculation factors
+KV_CACHE_KEY_VALUE_FACTOR = 2     # Factor of 2 for both Keys and Values
 
 
 @dataclass
@@ -81,17 +103,17 @@ def get_activation_overhead_gb(
     """
     # Fixed tiers based on empirical measurements
     if is_moe:
-        base = 3.0  # MoE routing overhead
-    elif params_billions < 10:
-        base = 1.2  # Small models (7B-8B)
-    elif params_billions <= 30:
-        base = 2.5  # Medium models (13B-27B)
+        base = OVERHEAD_MOE
+    elif params_billions < SMALL_MODEL_THRESHOLD:
+        base = OVERHEAD_SMALL
+    elif params_billions <= MEDIUM_MODEL_THRESHOLD:
+        base = OVERHEAD_MEDIUM
     else:
-        base = 4.0  # Large models (70B+)
+        base = OVERHEAD_LARGE
     
     # MLX has additional graph compilation ("wiring") overhead
     if backend == "mlx_lm":
-        base *= 1.15  # +15% for wiring spike
+        base *= MLX_WIRING_MULTIPLIER
     
     return base
 
@@ -131,10 +153,10 @@ def calculate_kv_cache_gb(
         # DeepSeek MLA: compressed KV cache using low-rank latent vectors
         # The compression is massive (90%+ reduction vs standard attention)
         # Formula uses kv_lora_rank instead of kv_heads * head_dim
-        kv_cache_bytes = 2 * num_layers * kv_lora_rank * context_length * dtype_bytes
+        kv_cache_bytes = KV_CACHE_KEY_VALUE_FACTOR * num_layers * kv_lora_rank * context_length * dtype_bytes
     else:
         # Standard attention: K and V both stored per head
-        kv_cache_bytes = 2 * num_layers * num_kv_heads * head_dim * context_length * dtype_bytes
+        kv_cache_bytes = KV_CACHE_KEY_VALUE_FACTOR * num_layers * num_kv_heads * head_dim * context_length * dtype_bytes
     
     return kv_cache_bytes / (1024**3)
 
@@ -164,27 +186,33 @@ def calculate_max_safe_context(
     if kv_lora_rank:
         # MLA mode: compressed KV cache
         if not metadata.num_layers:
-            return 16384
+            raise PreflightValidationError("Cannot calculate max context - missing num_layers for MLA model")
         # Bytes per token with MLA compression (FP16)
-        bytes_per_token = 2 * metadata.num_layers * kv_lora_rank * 2
+        bytes_per_token = KV_CACHE_KEY_VALUE_FACTOR * metadata.num_layers * kv_lora_rank * KV_DTYPE_FP16
     else:
         # Standard mode
         if not all([metadata.num_layers, metadata.num_kv_heads, metadata.head_dim]):
-            # Cannot calculate, return conservative default
-            return 16384
+            raise PreflightValidationError("Cannot calculate max context - missing architecture parameters (num_layers, num_kv_heads, head_dim)")
         # Bytes per token (FP16 cache)
-        bytes_per_token = 2 * metadata.num_layers * metadata.num_kv_heads * metadata.head_dim * 2
+        bytes_per_token = KV_CACHE_KEY_VALUE_FACTOR * metadata.num_layers * metadata.num_kv_heads * metadata.head_dim * KV_DTYPE_FP16
+    
+    # Handle negative or zero budget (base memory exceeds available)
+    if available_budget_gb <= 0:
+        return 0
     
     # Apply safety margin
     budget_bytes = available_budget_gb * (1024**3) * safety_factor
     
     max_tokens = int(budget_bytes / bytes_per_token)
     
-    # Clamp to reasonable bounds
-    min_viable = 16384  # 16K minimum for agents
-    max_supported = metadata.model_max_context or 131072  # Model's actual limit
+    # Ensure never negative (if calculation results in negative, return 0)
+    if max_tokens < 0:
+        return 0
     
-    return max(min_viable, min(max_tokens, max_supported))
+    # Clamp to reasonable bounds
+    max_supported = metadata.model_max_context or MAX_CONTEXT_UPPER_BOUND
+    
+    return min(max_tokens, max_supported)
 
 
 def estimate_llamacpp_memory(
@@ -206,10 +234,10 @@ def estimate_llamacpp_memory(
     # Weights: Use exact size from GGUF if available, else estimate
     if metadata.exact_model_size_gb:
         weights_gb = metadata.exact_model_size_gb
-    elif metadata.params_billions:
+    elif metadata.params_billions and metadata.bits_per_weight:
         weights_gb = (metadata.params_billions * 1e9 * metadata.bits_per_weight) / 8 / (1024**3)
     else:
-        weights_gb = 8.0  # Conservative fallback
+        raise PreflightValidationError("Cannot estimate memory - model parameter count unknown")
     
     # MoE models have router/gating at higher precision
     if metadata.is_moe:
@@ -220,22 +248,27 @@ def estimate_llamacpp_memory(
     kv_lora_rank = getattr(metadata, 'kv_lora_rank', None)
     
     if all([metadata.num_layers, metadata.num_kv_heads, metadata.head_dim]) or kv_lora_rank:
+        if not metadata.num_layers:
+            raise PreflightValidationError("Cannot calculate KV cache - missing num_layers")
+        if not kv_lora_rank and (not metadata.num_kv_heads or not metadata.head_dim):
+            raise PreflightValidationError("Cannot calculate KV cache - missing num_kv_heads or head_dim")
+        
         kv_cache_gb = calculate_kv_cache_gb(
             num_layers=metadata.num_layers,
-            num_kv_heads=metadata.num_kv_heads or 1,
-            head_dim=metadata.head_dim or 128,
+            num_kv_heads=metadata.num_kv_heads,
+            head_dim=metadata.head_dim,
             context_length=context_length,
-            dtype_bytes=2.0,  # FP16
+            dtype_bytes=KV_DTYPE_FP16,
             kv_lora_rank=kv_lora_rank
         )
     else:
-        # Fallback estimation based on model size
-        # Rough rule: KV cache ≈ 0.5 * (context / 4096) * (params / 7) GB
-        kv_cache_gb = 0.5 * (context_length / 4096) * ((metadata.params_billions or 8) / 7)
+        raise PreflightValidationError("Cannot calculate KV cache - missing architecture parameters (num_layers, num_kv_heads, head_dim)")
     
     # Overhead: Fixed tier
+    if not metadata.params_billions:
+        raise PreflightValidationError("Cannot determine overhead - parameter count unknown")
     overhead_gb = get_activation_overhead_gb(
-        params_billions=metadata.params_billions or 8,
+        params_billions=metadata.params_billions,
         is_moe=metadata.is_moe,
         backend="llama_cpp"
     )
@@ -274,10 +307,10 @@ def estimate_mlx_memory(
     # Weights: Calculate from params + quantization
     if metadata.exact_model_size_gb:
         weights_gb = metadata.exact_model_size_gb
-    elif metadata.params_billions:
+    elif metadata.params_billions and metadata.bits_per_weight:
         weights_gb = (metadata.params_billions * 1e9 * metadata.bits_per_weight) / 8 / (1024**3)
     else:
-        weights_gb = 8.0  # Conservative fallback
+        raise PreflightValidationError("Cannot estimate memory - model parameter count unknown")
     
     # MoE models have router/gating at higher precision
     if metadata.is_moe:
@@ -288,21 +321,27 @@ def estimate_mlx_memory(
     kv_lora_rank = getattr(metadata, 'kv_lora_rank', None)
     
     if all([metadata.num_layers, metadata.num_kv_heads, metadata.head_dim]) or kv_lora_rank:
+        if not metadata.num_layers:
+            raise PreflightValidationError("Cannot calculate KV cache - missing num_layers")
+        if not kv_lora_rank and (not metadata.num_kv_heads or not metadata.head_dim):
+            raise PreflightValidationError("Cannot calculate KV cache - missing num_kv_heads or head_dim")
+        
         kv_cache_gb = calculate_kv_cache_gb(
             num_layers=metadata.num_layers,
-            num_kv_heads=metadata.num_kv_heads or 1,
-            head_dim=metadata.head_dim or 128,
+            num_kv_heads=metadata.num_kv_heads,
+            head_dim=metadata.head_dim,
             context_length=context_length,
-            dtype_bytes=2.0,  # FP16 cache
+            dtype_bytes=KV_DTYPE_FP16,
             kv_lora_rank=kv_lora_rank
         )
     else:
-        # Fallback estimation
-        kv_cache_gb = 0.5 * (context_length / 4096) * ((metadata.params_billions or 8) / 7)
+        raise PreflightValidationError("Cannot calculate KV cache - missing architecture parameters (num_layers, num_kv_heads, head_dim)")
     
     # Overhead: Fixed tier with MLX multiplier
+    if not metadata.params_billions:
+        raise PreflightValidationError("Cannot determine overhead - parameter count unknown")
     overhead_gb = get_activation_overhead_gb(
-        params_billions=metadata.params_billions or 8,
+        params_billions=metadata.params_billions,
         is_moe=metadata.is_moe,
         backend="mlx_lm"  # Applies 1.15x for wiring
     )
@@ -349,20 +388,21 @@ def estimate_vllm_memory(
             dtype_bytes = metadata.bits_per_weight / 8
         weights_gb = (metadata.params_billions * 1e9 * dtype_bytes) / (1024**3)
     else:
-        weights_gb = 16.0  # Conservative fallback
+        raise PreflightValidationError("Cannot estimate memory - model parameter count unknown")
     
     # MoE models have router/gating at higher precision
     if metadata.is_moe:
         weights_gb *= MOE_WEIGHT_OVERHEAD
     
     # Overhead: Fixed tier + CUDA context
+    if not metadata.params_billions:
+        raise PreflightValidationError("Cannot determine overhead - parameter count unknown")
     base_overhead = get_activation_overhead_gb(
-        params_billions=metadata.params_billions or 16,
+        params_billions=metadata.params_billions,
         is_moe=metadata.is_moe,
         backend="vllm"
     )
-    cuda_context_gb = 0.5  # NCCL/PyTorch context
-    overhead_gb = base_overhead + cuda_context_gb
+    overhead_gb = base_overhead + VLLM_CUDA_CONTEXT_GB
     
     # For vLLM stage 1, we don't include KV cache
     # (vLLM will fill remaining space with PagedAttention blocks)

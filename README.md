@@ -46,11 +46,12 @@ engine = recommended_engine()
 print(f"Recommended: {engine.name} — {engine.reason}")
 
 # Preflight check
-result = model_preflight("mlx-community/Llama-3-8B-4bit", engine="mlx")
-if result.can_load:
-    print(f"Model fits. Safe context: {result.recommended_context:,} tokens")
+result = model_preflight("mlx-community/Llama-3-8B-4bit", engine="mlx_lm")
+if result.status:
+    print(f"✓ Model will run")
+    print(f"Context: {result.usable_context:,} tokens (limit: {result.context_limit:,})")
 else:
-    print(f"Model won't fit: {result.message}")
+    print(f"✗ Won't fit: {result.reason}")
 ```
 
 ---
@@ -119,18 +120,25 @@ Validates whether a model will fit in available memory before loading:
 ```python
 result = model_preflight("TheBloke/Llama-2-7B-GGUF", engine="llama_cpp")
 
-result.can_load          # True/False
-result.recommended_context  # Safe context length
-result.total_required_gb    # Memory needed
-result.available_gb         # Memory available
-result.message              # Human-readable explanation
+result.status           # True if can run, False if cannot
+result.reason           # Structured reason (enum with descriptive message)
+result.context_limit    # Model's designed maximum context
+result.usable_context   # Context your device can support
+result.required_gb      # Memory needed
+result.available_gb     # Memory available
+result.utilization      # Memory utilization ratio (0.0-1.0)
 ```
+
+**Context Fields Explained:**
+- `context_limit`: The model's inherent maximum (e.g., 32K for Llama 3)
+- `usable_context`: The actual context your hardware can support (may be reduced to fit in memory)
+- When `usable_context < context_limit`, context has been reduced but is still practical (≥4K tokens)
 
 The calculation accounts for:
 - Model weights (with quantization-specific bits-per-weight)
-- KV cache at the requested context length
+- KV cache at the model's full context length
 - Backend-specific runtime overhead
-- Safety buffers for OS and other processes
+- Target utilization threshold (default: 85%)
 
 For remote HuggingFace models, metadata is extracted via HTTP Range requests (~500KB) rather than downloading the full model.
 

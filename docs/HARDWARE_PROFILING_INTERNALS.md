@@ -378,46 +378,39 @@ The order reflects both performance and reliability. TensorRT-LLM and vLLM offer
 
 The memory validator uses hardware detection results to determine if a model will fit in memory before loading. This section describes the logic, safety margins, and thresholds.
 
-### Preflight Thresholds
+### Memory Validation Philosophy
 
-The validator uses two thresholds to classify preflight results:
+EdgeKit trusts OS-reported available memory and does not apply additional safety buffers.
 
-- **SAFE_THRESHOLD (70%)**: Below 70% utilization = PASSED. Model will load comfortably.
-- **WARNING_THRESHOLD (85%)**: 70-85% utilization = WARNING. Model will load but it's tight. Above 85% = FAILED.
+**OS Memory APIs are Already Conservative:**
+- **macOS**: Mach VM API reports instantly-reclaimable memory (free + speculative + external pages). System overhead, WindowServer, and running apps are already excluded.
+- **Linux**: `/proc/meminfo` MemAvailable is the kernel's conservative estimate, already including safety margins.
+- **Windows**: GlobalMemoryStatusEx available memory already accounts for DWM and running processes.
 
-These thresholds are intentionally conservative to account for runtime overhead, KV cache growth, and system processes.
-
-### Safety Buffers
-
-Memory buffers are deducted from available memory to ensure system stability:
-
-| Backend | Safety Buffer | Rationale |
-|---------|---------------|-----------|
-| MLX (≤16GB Mac) | 3.0 GB | Fixed reserve for tight memory systems |
-| MLX (>16GB Mac) | 20% of RAM | Percentage reserve for smooth operation |
-| llama.cpp | 1.0 GB | Minimum for OS and basic processes |
-| llama.cpp (Windows) | +1.0 GB | Additional DWM overhead on multi-monitor/HDR |
-| vLLM | 0.5 GB | System overhead (vLLM already limits to 90%) |
+**Utilization Threshold Provides Safety:**
+- Models using ≤ 85% of available memory are approved (15% buffer)
+- This single threshold ensures stability without over-reserving memory
 
 ### Backend-Specific Available Memory Calculation
 
 Each inference backend has different memory characteristics:
 
 **MLX (Apple Silicon)**
-- Uses unified memory (system RAM)
-- Tiered safety buffer: 3GB for ≤16GB Macs, 20% for >16GB Macs
-- Formula: Available = RAM available - safety buffer
+- Uses unified memory (system RAM shared with GPU)
+- Source: macOS Mach VM API (`host_statistics64`)
+- Returns instantly-reclaimable memory directly (no additional buffers)
 
 **vLLM (NVIDIA)**
 - Uses dedicated GPU VRAM
-- Prefers actual available VRAM from NVML (accounts for current usage)
-- Falls back to 90% of total VRAM (vLLM's default gpu_memory_utilization)
-- ECC tax is already reflected in NVML's reported available memory
+- Source: NVML (NVIDIA Management Library)
+- Prefers actual available VRAM (accounts for current usage)
+- Falls back to 90% of total VRAM (vLLM's default `gpu_memory_utilization=0.9`)
+- ECC overhead is already reflected in NVML's reported memory
 
 **llama.cpp (CPU)**
 - Uses system RAM
-- Deducts 1GB safety buffer (2GB on Windows due to DWM)
-- Formula: Available = RAM available - safety buffer
+- Source: Platform-specific (Mach VM / /proc/meminfo / GlobalMemoryStatusEx)
+- Returns OS-reported available memory directly (no additional buffers)
 
 ### AMD APU Handling
 

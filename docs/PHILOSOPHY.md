@@ -73,7 +73,7 @@ Instead of 3-page README instructions that 40% of users misunderstand, you gener
 
 ### Adaptive Context Windows
 ```python
-result = model_preflight("mlx-community/Llama-3-70B-8bit", engine="mlx")
+result = model_preflight("mlx-community/Llama-3-70B-8bit", engine="mlx_lm")
 # Recommended: 8,192 tokens (safe)
 # Max Safe: 16,384 tokens (tight)
 ```

@@ -32,7 +32,7 @@ Complete API documentation for EdgeKit, organized by module.
     - [`inspect_model_remote()`](#inspect_model_remote)
   - [Schemas](#models-schemas)
     - [`PreflightResult`](#preflightresult)
-    - [`PreflightStatus`](#preflightstatus)
+    - [`PreflightReason`](#preflightreason)
     - [`Engine`](#engine)
     - [`MemoryEstimate`](#memoryestimate)
     - [`ModelMetadata`](#modelmetadata)
@@ -41,7 +41,6 @@ Complete API documentation for EdgeKit, organized by module.
   - [Functions](#build-functions)
     - [`llama_cpp_args()`](#llama_cpp_args)
     - [`install_command()`](#install_command)
-- [Backwards Compatibility](#backwards-compatibility)
 - [Platform-Specific Notes](#platform-specific-notes)
 - [Error Handling](#error-handling)
 - [Type Hints & IDE Support](#type-hints--ide-support)
@@ -376,7 +375,7 @@ def model_preflight(
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `model_id` | `str` | HuggingFace repo ID (e.g., "mlx-community/Llama-3-8B-4bit") or local path (e.g., "/path/to/model.gguf") |
-| `engine` | [`Engine`](#engine) | Inference engine - `"mlx"`, `"llama_cpp"`, or `"vllm"` |
+| `engine` | [`Engine`](#engine) | Inference engine - `"mlx_lm"`, `"llama_cpp"`, or `"vllm"` |
 
 **Returns:**
 - [`PreflightResult`](#preflightresult) - Validation result with status, memory details, and context recommendations
@@ -401,23 +400,34 @@ The function uses model-specific memory estimation for each backend:
 ```python
 from edgekit import model_preflight
 
-# Check HuggingFace model (auto-downloads if needed)
-result = model_preflight("mlx-community/Llama-3-8B-4bit", engine="mlx")
+# Basic check with defaults
+result = model_preflight("mlx-community/Llama-3-8B-4bit", engine="mlx_lm")
 
-if result.can_load:
-    print(f"✓ Safe to load")
-    print(f"Recommended context: {result.recommended_context:,} tokens")
-    print(f"Max safe context: {result.max_context:,} tokens")
+if result.status:
+    print(f"✓ Model will run")
+    print(f"Context: {result.usable_context:,} tokens")
     print(f"Memory usage: {result.utilization*100:.1f}%")
+    print(f"Reason: {result.reason}")
+    
+    # Check if context was reduced
+    if result.usable_context < result.context_limit:
+        reduction = (1 - result.usable_context / result.context_limit) * 100
+        print(f"⚠️ Context reduced by {reduction:.0f}% from designed {result.context_limit:,}")
 else:
-    print(f"✗ Won't fit: {result.message}")
+    print(f"✗ Won't fit: {result.reason}")
+
+# Conservative: only use 70% of memory
+result = model_preflight("model-id", engine="mlx_lm", max_utilization=0.70)
+
+# Power user: push to 95%, accept lower context
+result = model_preflight("model-id", engine="mlx_lm", max_utilization=0.95, min_context=2048)
 
 # Check local GGUF file
 result = model_preflight("/path/to/model.gguf", engine="llama_cpp")
 ```
 
 **Raises:**
-- `ValueError` - If engine is not one of "mlx", "llama_cpp", or "vllm"
+- `ValueError` - If engine is not one of "mlx_lm", "llama_cpp", or "vllm"
 - `FileNotFoundError` - If local model path doesn't exist
 - `Exception` - If model download or inspection fails
 
@@ -440,7 +450,7 @@ def can_load(
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `model_id` | `str` | HuggingFace repo ID or local path |
-| `engine` | [`Engine`](#engine) | Inference engine - `"mlx"`, `"llama_cpp"`, or `"vllm"` |
+| `engine` | [`Engine`](#engine) | Inference engine - `"mlx_lm"`, `"llama_cpp"`, or `"vllm"` |
 
 **Returns:**
 - `bool` - `True` if model can load (passed or warning status), `False` otherwise
@@ -453,7 +463,7 @@ Convenience wrapper around [`model_preflight()`](#model_preflight) that returns 
 ```python
 from edgekit import can_load
 
-if can_load("mlx-community/Llama-3-8B-4bit", engine="mlx"):
+if can_load("mlx-community/Llama-3-8B-4bit", engine="mlx_lm"):
     # Proceed with loading
     from mlx_lm import load
     model, tokenizer = load("mlx-community/Llama-3-8B-4bit")
@@ -480,7 +490,7 @@ def inspect_model_remote(
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `repo_id` | `str` | HuggingFace repository ID (e.g., "meta-llama/Llama-3-8B") |
-| `engine` | [`Engine`](#engine) | Inference engine - `"mlx"`, `"llama_cpp"`, or `"vllm"` |
+| `engine` | [`Engine`](#engine) | Inference engine - `"mlx_lm"`, `"llama_cpp"`, or `"vllm"` |
 
 **Returns:**
 - [`ModelMetadata`](#modelmetadata) - Extracted model metadata
@@ -523,66 +533,50 @@ Result of model preflight check.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `status` | [`PreflightStatus`](#preflightstatus) | Validation status (PASSED/WARNING/FAILED/UNKNOWN) |
-| `message` | `str` | Human-readable status message |
+| `status` | `bool` | True if model can run, False if cannot |
+| `reason` | [`PreflightReason`](#preflightreason) | Structured reason (enum with descriptive message) |
 | `required_gb` | `float` | Memory required in GB (default: 0.0) |
 | `available_gb` | `float` | Available memory in GB (default: 0.0) |
 | `utilization` | `float` | Memory utilization ratio 0.0-1.0 (default: 0.0) |
-| `requested_context` | `int` | User-requested context length (default: 0) |
-| `recommended_context` | `int` | Recommended safe context length (default: 0) |
-| `max_context` | `int` | Maximum safe context length (default: 0) |
+| `context_limit` | `int` | Model's designed maximum context in tokens (default: 0) |
+| `usable_context` | `int` | Context your device can support in tokens (default: 0) |
 | `estimate` | [`MemoryEstimate`](#memoryestimate) ` \| None` | Detailed memory breakdown (optional) |
 
-**Properties:**
+**Understanding Context Fields:**
 
-| Property | Type | Description |
-|----------|------|-------------|
-| `passed` | `bool` | True if status is PASSED |
-| `warning` | `bool` | True if status is WARNING |
-| `failed` | `bool` | True if status is FAILED |
-| `can_load` | `bool` | True if status is PASSED or WARNING |
+The distinction between `context_limit` and `usable_context` is critical:
 
-**Methods:**
-- `raise_if_failed()` - Raises `MemoryError` if status is FAILED
+- **`context_limit`**: The model's inherent maximum context length (e.g., 32,768 tokens for Llama 3). This is determined by the model's architecture and training. This value never changes based on your hardware.
+
+- **`usable_context`**: The actual context length your hardware can support while staying within memory limits (default 85% utilization). This may be:
+  - **Equal to `context_limit`**: Model fits at full designed capacity
+  - **Less than `context_limit`**: Context reduced to fit in memory, but still practical (≥4K tokens minimum)
+  - **Zero**: Model cannot fit (status=False)
 
 **Example:**
 ```python
-result = model_preflight("mlx-community/Llama-3-8B-4bit", engine="mlx")
+result = model_preflight("mlx-community/Llama-3-8B-4bit", engine="mlx_lm")
 
-# Check status
-if result.passed:
-    print("Safe to load with plenty of headroom")
-elif result.warning:
-    print("Can load but memory is tight")
-elif result.failed:
-    print("Don't attempt to load")
-
-# Access details
-print(f"Required: {result.required_gb:.1f} GB")
-print(f"Available: {result.available_gb:.1f} GB")
-print(f"Utilization: {result.utilization*100:.0f}%")
-print(f"Max context: {result.max_context:,} tokens")
-
-# Raise on failure
-result.raise_if_failed()  # Throws MemoryError if failed
+if result.status:
+    print(f"✓ {result.reason}")
+    print(f"Memory: {result.utilization*100:.0f}%")
+    
+    # Check for context reduction
+    if result.usable_context < result.context_limit:
+        reduction = (1 - result.usable_context / result.context_limit) * 100
+        print(f"⚠️ Context reduced by {reduction:.0f}%:")
+        print(f"   Model designed for: {result.context_limit:,} tokens")
+        print(f"   Device supports: {result.usable_context:,} tokens")
+    else:
+        print(f"✓ Full context: {result.context_limit:,} tokens")
+else:
+    print(f"✗ {result.reason}")
+    print(f"   Context limit: {result.context_limit:,}")
+    print(f"   Usable: {result.usable_context:,}")  # Will be 0
 ```
 
 ---
 
-#### `PreflightStatus`
-
-Preflight check status enumeration.
-
-**Values:**
-
-| Value | Description |
-|-------|-------------|
-| `PASSED` | Safe to load (< 70% memory utilization) |
-| `WARNING` | Can load but tight fit (70-85% utilization) |
-| `FAILED` | Don't attempt to load (> 85% utilization) |
-| `UNKNOWN` | Could not determine (error during validation) |
-
----
 
 #### `Engine`
 
@@ -590,11 +584,11 @@ Type alias for inference engine parameter.
 
 **Type:**
 ```python
-Engine = Literal["mlx", "llama_cpp", "vllm"]
+Engine = Literal["mlx_lm", "llama_cpp", "vllm"]
 ```
 
 **Valid Values:**
-- `"mlx"` - MLX framework (Apple Silicon)
+- `"mlx_lm"` - MLX framework (Apple Silicon)
 - `"llama_cpp"` - llama.cpp backend
 - `"vllm"` - vLLM backend (NVIDIA GPUs)
 
@@ -785,20 +779,6 @@ ps_cmd = install_command(shell="powershell")
 
 ---
 
-## Backwards Compatibility
-
-The following aliases are provided for backwards compatibility:
-
-**Hardware module:**
-- `systeminfo()` → `system_info()` (deprecated, use `system_info()`)
-- `optimal_inference_engine()` → `recommended_engine()` (deprecated, use `recommended_engine()`)
-
-**Models module:**
-- `ValidationResult` → `PreflightResult` (deprecated, use `PreflightResult`)
-- `ValidationStatus` → `PreflightStatus` (deprecated, use `PreflightStatus`)
-
----
-
 ## Platform-Specific Notes
 
 ### macOS
@@ -831,8 +811,7 @@ All functions follow these error handling principles:
 
 | Exception | When Raised | How to Handle |
 |-----------|-------------|---------------|
-| `ValueError` | Invalid engine parameter in `model_preflight()` | Use `"mlx"`, `"llama_cpp"`, or `"vllm"` |
-| `MemoryError` | Model validation fails (explicit) | Call `result.raise_if_failed()` or check `result.failed` |
+| `ValueError` | Invalid engine parameter in `model_preflight()` or missing model metadata | Use `"mlx_lm"`, `"llama_cpp"`, or `"vllm"`. Check `result.reason` for metadata issues. |
 | `FileNotFoundError` | Local model path doesn't exist | Verify path or use HuggingFace repo ID |
 | `OSError` | macOS Mach kernel API fails | Falls back to psutil if available |
 
@@ -853,7 +832,7 @@ from edgekit.models import PreflightResult, Engine
 
 # Fully typed
 hw: HardwareProfile = system_info()
-result: PreflightResult = model_preflight("model-id", engine="mlx")
+result: PreflightResult = model_preflight("model-id", engine="mlx_lm")
 engine_type: Engine = "llama_cpp"  # Type-safe literal
 ```
 
@@ -885,7 +864,7 @@ from edgekit.hardware import HardwareProfile
 hw_restored = HardwareProfile(**hw_dict)
 
 # Validation results
-result = model_preflight("model-id", engine="mlx")
+result = model_preflight("model-id", engine="mlx_lm")
 result_json = result.model_dump_json()
 with open("preflight.json", "w") as f:
     f.write(result_json)

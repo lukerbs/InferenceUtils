@@ -46,7 +46,7 @@ The `edgekit.models` module exports:
 - **`model_preflight(model_id, engine)`** — Full preflight check returning a `PreflightResult` with status, memory breakdown, and context recommendations
 - **`can_load(model_id, engine)`** — Simple boolean check for quick pass/fail decisions
 - **`inspect_model_remote(model_id, engine)`** — Low-level remote metadata extraction (raises `RemoteInspectError` on failure)
-- **`PreflightResult`** — Dataclass with `.passed`, `.warning`, `.failed`, `.can_load` properties
+- **`PreflightResult`** — Dataclass with boolean `status` and structured `reason` enum
 - **`ModelMetadata`** — Dataclass containing extracted model architecture parameters
 - **`MemoryEstimate`** — Dataclass with weights/KV cache/overhead breakdown
 
@@ -534,43 +534,45 @@ If authentication fails (401/403), we raise `RemoteInspectError` to trigger fall
 
 Preflight validation compares estimated memory requirements against available hardware memory.
 
-### Thresholds and Status
+### Validation Logic and Status
 
-| Utilization | Status | Meaning |
-|-------------|--------|---------|
-| < 70% | `PASSED` | Safe to load, comfortable headroom |
-| 70-85% | `WARNING` | Can load but tight, may swap under load |
-| > 85% | `FAILED` | Do not attempt, will likely OOM |
+**Target Threshold:** 85% memory utilization (configurable via `max_utilization` parameter)
 
-These thresholds are intentionally conservative to account for:
-- Runtime memory spikes
-- KV cache growth during generation
-- System processes competing for RAM
+The validation follows this logic:
+1. **Try full context first** - Always respect the model's designed capability
+2. **If doesn't fit:** Calculate reduced context that achieves exactly 85% utilization
+3. **Check viability:** Reduced context must be ≥ 4K tokens (configurable via `min_context`)
+
+**Status outcomes:**
+- `status=True`: Model can run (at full or reduced context, if reduced context ≥ min_context)
+- `status=False`: Model cannot run (base too large, or would require <4K context)
+
+The utilization is calculated against OS-reported available memory, which already represents instantly-reclaimable memory (excluding system overhead, running processes, and wired/locked memory). No additional safety buffers are applied.
 
 ### PreflightResult API
 
-The `PreflightResult` dataclass provides both raw data and convenience helpers:
+The `PreflightResult` dataclass provides structured validation results:
 
-**Status properties:**
-- `.passed` — True if utilization < 70%
-- `.warning` — True if utilization is 70-85%
-- `.failed` — True if utilization > 85%
-- `.can_load` — True if passed OR warning (model will load)
+**Status fields:**
+- `.status` (bool) — True if model can run, False if cannot
+- `.reason` (PreflightReason enum) — Structured reason with descriptive message
 
 **Memory details:**
 - `.required_gb` — Total memory needed
 - `.available_gb` — Available memory detected
 - `.utilization` — Fraction (0.0 to 1.0+)
 
-**Context recommendations:**
-- `.max_context` — Maximum safe context length in tokens
-- `.recommended_context` — Conservative recommendation (80% of max)
+**Context fields (Critical):**
+- `.context_limit` — Model's designed maximum context (inherent property)
+- `.usable_context` — Context your device can support (hardware-constrained)
+
+**Understanding context fields:**
+- When `usable_context == context_limit`: Model runs at full designed capability
+- When `usable_context < context_limit`: Context reduced to fit memory, but still practical
+- When `usable_context == 0`: Model cannot fit (status=False)
 
 **Detailed breakdown:**
 - `.estimate` — `MemoryEstimate` object with weights/kv/overhead split
-
-**Error handling:**
-- `.raise_if_failed()` — Raises `MemoryError` if preflight failed
 
 ### Backend-Specific Validation
 
@@ -578,27 +580,40 @@ Each inference backend has different memory characteristics.
 
 #### MLX (Apple Silicon)
 
-- Uses unified memory (shared CPU/GPU RAM)
-- Tiered safety buffer:
-  - ≤16GB Macs: 3GB reserve (tight but viable)
-  - >16GB Macs: 20% reserve (smooth operation)
-- Graph compilation adds 15% temporary spike
+- **Memory source**: Unified memory (shared CPU/GPU RAM pool)
+- **Detection method**: macOS Mach VM API (`host_statistics64`)
+- **Available memory**: Free + speculative + external (file-backed) pages
+  - Excludes: Wired memory, compressed memory, active app memory, WindowServer
+- **Overhead accounting**: Graph compilation ("wiring") adds ~15% temporary spike (included in activation overhead estimate)
+- **No additional buffers**: OS-reported available memory is used directly
+
+The Mach VM API provides instant-reclaimable memory. System overhead, kernel, and running applications are already excluded from the available count.
 
 #### llama.cpp (CPU)
 
-- Uses system RAM
-- 1GB safety buffer (2GB on Windows for DWM)
-- Pre-allocates entire KV cache at startup
+- **Memory source**: System RAM
+- **Detection methods**:
+  - macOS: Mach VM API (same as MLX)
+  - Linux: `/proc/meminfo` `MemAvailable` (kernel's conservative estimate)
+  - Windows: `GlobalMemoryStatusEx` available memory
+- **Pre-allocation**: Entire KV cache is allocated at startup based on `n_ctx`
+- **No additional buffers**: OS-reported available memory is used directly
+
+All platforms provide conservative available memory estimates that already account for running processes (including DWM on Windows).
 
 #### vLLM (NVIDIA GPU)
 
-- Uses dedicated VRAM
-- Two-stage validation:
-  1. Can weights + overhead fit?
-  2. How much context fits in remaining space?
-- PagedAttention fills remaining VRAM with KV blocks
-- Default `gpu_memory_utilization=0.9` (90% of VRAM)
-- CUDA context overhead: ~0.5GB for NCCL/PyTorch
+- **Memory source**: Dedicated GPU VRAM
+- **Detection method**: NVML (NVIDIA Management Library)
+- **Available VRAM**: Reported by driver (accounts for ECC overhead if enabled)
+- **Two-stage validation**:
+  1. **Stage 1**: Can weights + overhead fit in VRAM?
+  2. **Stage 2**: How much context fits in remaining space?
+- **PagedAttention**: Fills remaining VRAM with KV blocks dynamically
+- **Default behavior**: vLLM reserves 90% of VRAM (`gpu_memory_utilization=0.9`)
+- **CUDA overhead**: ~0.5GB for NCCL/PyTorch context (included in activation overhead estimate)
+
+The 85% utilization threshold works the same across all backends, providing consistent validation. Models that fit within this threshold return status=True, those exceeding it return status=False.
 
 ### Context Length Calculation
 

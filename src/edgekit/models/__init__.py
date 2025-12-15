@@ -9,9 +9,10 @@ from .memory_validator import (
     model_preflight,
     can_load,
     PreflightResult,
-    PreflightStatus,
+    PreflightReason,
     Engine,
 )
+from .exceptions import PreflightValidationError
 
 from .model_inspector import ModelMetadata
 from .model_inspector_remote import (
@@ -25,7 +26,7 @@ __all__ = [
     "model_preflight",
     "can_load", 
     "PreflightResult",
-    "PreflightStatus",
+    "PreflightReason",
     "Engine",
     
     # Advanced types
@@ -35,4 +36,7 @@ __all__ = [
     # Remote inspection (for advanced usage)
     "RemoteInspectError",
     "inspect_model_remote",
+    
+    # Exceptions
+    "PreflightValidationError",
 ]

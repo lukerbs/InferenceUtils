@@ -19,7 +19,7 @@ from ..hardware import system_info
 logger = logging.getLogger(__name__)
 
 # Type alias for inference engine parameter
-Engine = Literal["mlx", "llama_cpp", "vllm"]
+Engine = Literal["mlx_lm", "llama_cpp", "vllm"]
 
 from .model_inspector import (
     inspect_gguf_model,
@@ -30,6 +30,7 @@ from .model_inspector_remote import (
     inspect_model_remote,
     RemoteInspectError,
 )
+from .exceptions import PreflightValidationError
 from .memory_estimator import (
     estimate_llamacpp_memory,
     estimate_mlx_memory,
@@ -43,58 +44,46 @@ from .memory_estimator import (
 # CONFIGURATION CONSTANTS
 # ============================================================================
 
-SAFE_THRESHOLD = 0.70       # < 70% utilization = passed
-WARNING_THRESHOLD = 0.85    # 70-85% = warning, > 85% = failed
+# Memory utilization thresholds
+WARNING_THRESHOLD = 0.85    # 85% utilization = target threshold for context reduction
 
-LLAMACPP_SAFETY_BUFFER_GB = 1.0
-VLLM_SYSTEM_OVERHEAD_GB = 0.5
+# Context limits
+MIN_VIABLE_CONTEXT = 4096   # 4K tokens minimum (research-backed, configurable via API)
 
-MIN_VIABLE_CONTEXT = 16384  # 16K tokens minimum
-DEFAULT_CONTEXT = 32768     # 32K tokens default
+# GPU memory utilization defaults
+VLLM_GPU_UTILIZATION_DEFAULT = 0.9   # vLLM reserves 90% of VRAM by default
+AMD_APU_MEMORY_RESERVE = 0.85         # Conservative reserve for APU shared memory
 
-
-def get_macos_safety_buffer_gb(total_ram_gb: float) -> float:
-    """
-    Get tiered safety buffer for macOS unified memory.
-    
-    macOS requires memory reserved for:
-    - WindowServer and display buffer (~1-2GB on high-res displays)
-    - Kernel and system services
-    - Wired memory limits (cannot swap ML tensors)
-    
-    Research-validated tiers:
-    - <=16GB Macs: Fixed 3GB reserve (tight but viable)
-    - >16GB Macs: 20% reserve (smooth operation zone)
-    
-    Args:
-        total_ram_gb: Total system RAM in GB
-        
-    Returns:
-        Safety buffer in GB
-    """
-    if total_ram_gb <= 16:
-        return 3.0
-    return total_ram_gb * 0.20
+# Fallback for unknown backend/detection failures
+UNKNOWN_MEMORY_GB = 0.0              # Fail gracefully with 0 instead of guessing
 
 
 # ============================================================================
 # PREFLIGHT RESULT
 # ============================================================================
 
-class PreflightStatus(Enum):
-    """Preflight check status."""
-    PASSED = "passed"       # Safe to load
-    WARNING = "warning"     # Can load but tight fit
-    FAILED = "failed"       # Don't attempt to load
-    UNKNOWN = "unknown"     # Could not determine
+class PreflightReason(Enum):
+    """Reason for preflight result."""
+    
+    # Failures (status=False)
+    VALIDATION_FAILED = "Cannot validate - model metadata incomplete"
+    MEMORY_EXCEEDED = "Model too large - weights and overhead exceed memory limit"
+    CONTEXT_INSUFFICIENT = "Model would require impractically low context (<4K tokens) to fit"
+    
+    # Success (status=True)
+    FULL_CONTEXT = "Model fits at full designed context"
+    REDUCED_CONTEXT = "Model fits with context reduction (still practical)"
+    
+    def __str__(self):
+        return self.value
 
 
 @dataclass
 class PreflightResult:
     """Result of model preflight check."""
     
-    status: PreflightStatus
-    message: str
+    status: bool                # True = can run, False = cannot run
+    reason: PreflightReason     # Structured reason with descriptive message
     
     # Memory details
     required_gb: float = 0.0
@@ -102,46 +91,11 @@ class PreflightResult:
     utilization: float = 0.0
     
     # Context information
-    requested_context: int = 0
-    recommended_context: int = 0
-    max_context: int = 0  # Renamed from max_safe_context
+    context_limit: int = 0      # Model's designed maximum context
+    usable_context: int = 0     # Context supported by device
     
     # Detailed breakdown (optional)
     estimate: Optional[MemoryEstimate] = None
-    
-    # -------------------------------------------------------------------------
-    # Pythonic helper properties
-    # -------------------------------------------------------------------------
-    
-    @property
-    def passed(self) -> bool:
-        """True if model can load safely."""
-        return self.status == PreflightStatus.PASSED
-    
-    @property
-    def warning(self) -> bool:
-        """True if model can load but is a tight fit."""
-        return self.status == PreflightStatus.WARNING
-    
-    @property
-    def failed(self) -> bool:
-        """True if model won't fit - don't attempt to load."""
-        return self.status == PreflightStatus.FAILED
-    
-    @property
-    def can_load(self) -> bool:
-        """True if model can load (passed or warning)."""
-        return self.status in (PreflightStatus.PASSED, PreflightStatus.WARNING)
-    
-    def raise_if_failed(self) -> None:
-        """Raise MemoryError if preflight failed."""
-        if self.failed:
-            raise MemoryError(self.message)
-
-
-# Backwards compatibility aliases
-ValidationStatus = PreflightStatus
-ValidationResult = PreflightResult
 
 
 # ============================================================================
@@ -153,11 +107,15 @@ def get_available_memory(backend: str) -> Tuple[float, str]:
     Get available memory for the specified backend.
     
     Uses platform-specific memory detection to provide accurate estimates.
-    Accounts for quirks like:
-    - macOS: Cached files and speculative memory (reclaimable)
-    - Windows: Standby list, DWM overhead (~1GB on multi-monitor/HDR setups)
-    - Linux: SReclaimable slab memory
-    - NVIDIA: ECC tax (6-12% on data center GPUs), available VRAM vs total
+    The OS-reported available memory already accounts for system overhead,
+    so no additional safety buffers are applied. The utilization thresholds
+    (70%/85%) provide adequate safety margins.
+    
+    Platform-specific memory sources:
+    - macOS: Mach VM API (free + speculative + external pages)
+    - Windows: Available memory from GlobalMemoryStatusEx
+    - Linux: MemAvailable from /proc/meminfo
+    - NVIDIA: Available VRAM from NVML (accounts for ECC if enabled)
     - AMD APU: GTT (system RAM accessible to GPU) beyond small VRAM aperture
     - Intel iGPU: WDDM 50% shared memory cap on Windows
     
@@ -172,12 +130,10 @@ def get_available_memory(backend: str) -> Tuple[float, str]:
         platform = hw.os.platform
         
         if backend == "mlx_lm":
-            # Apple Silicon unified memory (already uses Mach API for accurate available)
-            total_ram = hw.ram.total_gb or 16  # Default to 16GB if unknown
+            # Apple Silicon unified memory
+            # Mach VM API provides accurate instantly-reclaimable memory
             available = hw.ram.available_gb or 0
-            safety_buffer = get_macos_safety_buffer_gb(total_ram)
-            usable = available - safety_buffer
-            return max(0, usable), "unified memory (macOS)"
+            return max(0, available), "unified memory (macOS)"
         
         elif backend == "vllm":
             # NVIDIA GPU VRAM
@@ -188,8 +144,8 @@ def get_available_memory(backend: str) -> Tuple[float, str]:
                 if gpu.available_vram_gb is not None:
                     available_vram = gpu.available_vram_gb
                 else:
-                    # Fallback to total * 0.9 (vLLM default utilization)
-                    available_vram = gpu.vram_gb * 0.9
+                    # Fallback to total * VLLM_GPU_UTILIZATION_DEFAULT
+                    available_vram = gpu.vram_gb * VLLM_GPU_UTILIZATION_DEFAULT
                 
                 # Note: ECC tax is already reflected in available_vram_gb if ECC is enabled
                 # We don't need to deduct it again - the NVML memory info already accounts for it
@@ -204,356 +160,25 @@ def get_available_memory(backend: str) -> Tuple[float, str]:
                     gtt_free = (gpu.gtt_total_gb or 0) - (gpu.gtt_used_gb or 0)
                     vram_free = gpu.available_vram_gb or gpu.vram_gb or 0
                     total_available = vram_free + gtt_free
-                    return total_available * 0.85, "APU unified memory (VRAM+GTT)"
+                    return total_available * AMD_APU_MEMORY_RESERVE, "APU unified memory (VRAM+GTT)"
                 elif gpu.available_vram_gb:
-                    return gpu.available_vram_gb * 0.9, "GPU VRAM"
+                    return gpu.available_vram_gb * VLLM_GPU_UTILIZATION_DEFAULT, "GPU VRAM"
             
             return 0.0, "no compatible GPU detected"
         
         elif backend == "llama_cpp":
             # System RAM - llama.cpp runs on CPU primarily
+            # OS-reported available memory already accounts for running processes
+            # including DWM on Windows, kernel overhead, etc.
             available = hw.ram.available_gb or 0
-            
-            # Apply platform-specific deductions for system overhead
-            if platform == "Windows":
-                # Windows DWM overhead: ~1GB on multi-monitor/HDR, ~0.5GB otherwise
-                # Use conservative estimate since we can't detect monitor config easily
-                dwm_overhead = 1.0
-                available = available - dwm_overhead
-            elif platform == "Linux":
-                # Linux MemAvailable is already smart, but add small buffer for safety
-                pass  # SReclaimable is already in MemAvailable calculation
-            
-            usable = available - LLAMACPP_SAFETY_BUFFER_GB
-            return max(0, usable), "system RAM"
+            return max(0, available), "system RAM"
         
         else:
-            # Unknown backend
-            return 16.0, "unknown"
+            # Unknown backend - fail gracefully
+            return UNKNOWN_MEMORY_GB, "unknown"
             
     except Exception:
-        return 16.0, "estimated"
-
-
-def get_gpu_available_memory() -> Tuple[float, str]:
-    """
-    Get available GPU memory, accounting for platform-specific quirks.
-    
-    Returns:
-        Tuple of (available_gb, description)
-    """
-    try:
-        hw = system_info()
-        
-        # NVIDIA
-        if hw.gpu.nvidia and len(hw.gpu.nvidia) > 0:
-            gpu = hw.gpu.nvidia[0]
-            available = gpu.available_vram_gb or (gpu.vram_gb * 0.9)
-            note = " (ECC enabled - 6-12% capacity reduction)" if gpu.ecc_enabled else ""
-            return available, f"NVIDIA {gpu.model}{note}"
-        
-        # AMD
-        if hw.gpu.amd and len(hw.gpu.amd) > 0:
-            gpu = hw.gpu.amd[0]
-            if gpu.is_apu and gpu.gtt_total_gb:
-                gtt_free = (gpu.gtt_total_gb or 0) - (gpu.gtt_used_gb or 0)
-                vram_free = gpu.available_vram_gb or 0
-                return vram_free + gtt_free, f"AMD APU {gpu.model} (VRAM + GTT)"
-            return gpu.available_vram_gb or gpu.vram_gb or 0, f"AMD {gpu.model}"
-        
-        # Intel
-        if hw.gpu.intel and len(hw.gpu.intel) > 0:
-            gpu = hw.gpu.intel[0]
-            if gpu.type == "iGPU" and gpu.shared_memory_limit_gb:
-                # iGPU is capped by WDDM limit
-                return gpu.shared_memory_limit_gb, f"Intel iGPU (WDDM limit: {gpu.shared_memory_limit_gb}GB)"
-            return gpu.vram_gb or 0, f"Intel {gpu.model}"
-        
-        # Apple (unified memory)
-        if hw.gpu.apple:
-            return hw.ram.available_gb or 0, "Apple unified memory"
-        
-        return 0.0, "no GPU detected"
-        
-    except Exception:
-        return 0.0, "GPU detection failed"
-
-
-# ============================================================================
-# VALIDATION FUNCTIONS
-# ============================================================================
-
-def _validate_gguf_memory(
-    gguf_path: str,
-    model_id: str
-) -> PreflightResult:
-    """
-    Internal: Validate memory for a GGUF model (llama.cpp backend).
-    
-    Args:
-        gguf_path: Path to the local GGUF file
-        model_id: Original model ID
-        
-    Returns:
-        ValidationResult with status and recommendations
-    """
-    try:
-        # Extract metadata from GGUF file
-        metadata = inspect_gguf_model(gguf_path, model_id)
-        
-        # Determine context length (use model's full max)
-        if metadata.model_max_context:
-            context = metadata.model_max_context  # Use full model max!
-        else:
-            context = DEFAULT_CONTEXT  # Fallback only if unknown
-        
-        # Get available memory
-        available_gb, mem_type = get_available_memory("llama_cpp")
-        
-        if available_gb <= 0:
-            return PreflightResult(
-                status=PreflightStatus.UNKNOWN,
-                message="Could not determine available memory",
-                recommended_context=context
-            )
-        
-        # Calculate memory requirements
-        estimate = estimate_llamacpp_memory(metadata, context)
-        estimate.available_gb = available_gb
-        
-        # Calculate utilization
-        utilization = estimate.total_required_gb / available_gb
-        
-        # Calculate max safe context (handle negative budget)
-        kv_budget = available_gb - estimate.weights_gb - estimate.overhead_gb
-        if kv_budget <= 0:
-            return PreflightResult(
-                status=PreflightStatus.FAILED,
-                message=_format_critical_message(
-                    estimate=estimate,
-                    available_gb=available_gb,
-                    mem_type=mem_type,
-                    reason="Model weights and overhead alone exceed available memory"
-                ),
-                required_gb=estimate.total_required_gb,
-                available_gb=available_gb,
-                utilization=utilization,
-                estimate=estimate
-            )
-        max_safe_context = calculate_max_safe_context(kv_budget, metadata)
-        estimate.max_safe_context = max_safe_context
-        
-        # Determine status
-        return _make_decision(
-            utilization=utilization,
-            estimate=estimate,
-            metadata=metadata,
-            requested_context=context,
-            max_safe_context=max_safe_context,
-            available_gb=available_gb,
-            mem_type=mem_type
-        )
-        
-    except Exception as e:
-        return PreflightResult(
-            status=PreflightStatus.UNKNOWN,
-            message=f"Memory validation failed: {e}",
-            recommended_context=DEFAULT_CONTEXT
-        )
-
-
-def _validate_mlx_memory(
-    model_cache_path: str,
-    model_id: str
-) -> PreflightResult:
-    """
-    Internal: Validate memory for an MLX model.
-    
-    Args:
-        model_cache_path: Path to the cached model directory
-        model_id: Original model ID
-        
-    Returns:
-        ValidationResult with status and recommendations
-    """
-    try:
-        # Extract metadata from config.json
-        metadata = inspect_transformers_model(model_cache_path, model_id)
-        
-        # Determine context length (use model's full max)
-        if metadata.model_max_context:
-            context = metadata.model_max_context  # Use full model max!
-        else:
-            context = DEFAULT_CONTEXT  # Fallback only if unknown
-        
-        # Get available memory
-        available_gb, mem_type = get_available_memory("mlx_lm")
-        
-        if available_gb <= 0:
-            return PreflightResult(
-                status=PreflightStatus.UNKNOWN,
-                message="Could not determine available memory",
-                recommended_context=context
-            )
-        
-        # Calculate memory requirements
-        estimate = estimate_mlx_memory(metadata, context)
-        estimate.available_gb = available_gb
-        
-        # Calculate utilization
-        utilization = estimate.total_required_gb / available_gb
-        
-        # Calculate max safe context (handle negative budget)
-        kv_budget = available_gb - estimate.weights_gb - estimate.overhead_gb
-        if kv_budget <= 0:
-            return PreflightResult(
-                status=PreflightStatus.FAILED,
-                message=_format_critical_message(
-                    estimate=estimate,
-                    available_gb=available_gb,
-                    mem_type=mem_type,
-                    reason="Model weights and overhead alone exceed available memory"
-                ),
-                required_gb=estimate.total_required_gb,
-                available_gb=available_gb,
-                utilization=utilization,
-                estimate=estimate
-            )
-        max_safe_context = calculate_max_safe_context(kv_budget, metadata)
-        estimate.max_safe_context = max_safe_context
-        
-        # Determine status
-        return _make_decision(
-            utilization=utilization,
-            estimate=estimate,
-            metadata=metadata,
-            requested_context=context,
-            max_safe_context=max_safe_context,
-            available_gb=available_gb,
-            mem_type=mem_type
-        )
-        
-    except Exception as e:
-        return PreflightResult(
-            status=PreflightStatus.UNKNOWN,
-            message=f"Memory validation failed: {e}",
-            recommended_context=DEFAULT_CONTEXT
-        )
-
-
-def _validate_vllm_memory(
-    model_cache_path: str,
-    model_id: str
-) -> PreflightResult:
-    """
-    Internal: Validate memory for a vLLM model (two-stage validation).
-    
-    Stage 1: Can the model load at all? (weights + overhead < VRAM)
-    Stage 2: How much context can we get? (remaining space for PagedAttention)
-    
-    Args:
-        model_cache_path: Path to the cached model directory
-        model_id: Original model ID
-        
-    Returns:
-        ValidationResult with status and recommendations
-    """
-    try:
-        # Extract metadata from config.json
-        metadata = inspect_transformers_model(model_cache_path, model_id)
-        
-        # Get available VRAM
-        available_gb, mem_type = get_available_memory("vllm")
-        
-        if available_gb <= 0:
-            return PreflightResult(
-                status=PreflightStatus.FAILED,
-                message="No NVIDIA GPU detected. vLLM requires a CUDA-capable GPU.",
-                required_gb=0,
-                available_gb=0
-            )
-        
-        # Stage 1: Can it load?
-        estimate = estimate_vllm_memory(metadata)
-        estimate.available_gb = available_gb
-        
-        load_required = estimate.total_required_gb
-        
-        if load_required > available_gb:
-            return PreflightResult(
-                status=PreflightStatus.FAILED,
-                message=_format_critical_message(
-                    estimate=estimate,
-                    available_gb=available_gb,
-                    mem_type=mem_type,
-                    reason="Model weights and overhead exceed available GPU memory"
-                ),
-                required_gb=load_required,
-                available_gb=available_gb,
-                estimate=estimate
-            )
-        
-        # Stage 2: How much context?
-        kv_budget = available_gb - load_required
-        max_safe_context = calculate_max_safe_context(kv_budget, metadata)
-        estimate.max_safe_context = max_safe_context
-        
-        if max_safe_context < MIN_VIABLE_CONTEXT:
-            return PreflightResult(
-                status=PreflightStatus.FAILED,
-                message=_format_critical_message(
-                    estimate=estimate,
-                    available_gb=available_gb,
-                    mem_type=mem_type,
-                    reason=f"Maximum safe context ({max_safe_context:,}) is below minimum viable ({MIN_VIABLE_CONTEXT:,})"
-                ),
-                required_gb=load_required,
-                available_gb=available_gb,
-                max_context=max_safe_context,
-                estimate=estimate
-            )
-        
-        # Calculate utilization for the full recommended context
-        utilization = load_required / available_gb
-        recommended_context = int(max_safe_context * 0.8)  # Conservative
-        
-        if utilization > WARNING_THRESHOLD:
-            return PreflightResult(
-                status=PreflightStatus.WARNING,
-                message=_format_warning_message(
-                    estimate=estimate,
-                    max_context=max_safe_context,
-                    recommended_context=recommended_context,
-                    mem_type=mem_type,
-                    extra_note="vLLM reserves 90% of VRAM by default."
-                ),
-                required_gb=load_required,
-                available_gb=available_gb,
-                utilization=utilization,
-                max_context=max_safe_context,
-                recommended_context=recommended_context,
-                estimate=estimate
-            )
-        
-        return PreflightResult(
-            status=PreflightStatus.PASSED,
-            message=_format_safe_message(
-                max_context=max_safe_context,
-                extra_note="vLLM reserves 90% of VRAM by default."
-            ),
-            required_gb=load_required,
-            available_gb=available_gb,
-            utilization=utilization,
-            max_context=max_safe_context,
-            recommended_context=max_safe_context,
-            estimate=estimate
-        )
-        
-    except Exception as e:
-        return PreflightResult(
-            status=PreflightStatus.UNKNOWN,
-            message=f"Memory validation failed: {e}"
-        )
+        return UNKNOWN_MEMORY_GB, "estimated"
 
 
 # ============================================================================
@@ -562,26 +187,17 @@ def _validate_vllm_memory(
 
 def _log_preflight_result(result: "PreflightResult") -> None:
     """Log preflight result details using the module logger."""
-    status_icons = {
-        PreflightStatus.PASSED: "[✓]",
-        PreflightStatus.WARNING: "[!]",
-        PreflightStatus.FAILED: "[✗]",
-        PreflightStatus.UNKNOWN: "[?]"
-    }
-    icon = status_icons.get(result.status, "[?]")
+    icon = "[✓]" if result.status else "[✗]"
+    status_text = "PASSED" if result.status else "FAILED"
     
     # Use appropriate log level based on status
-    log_fn = logger.info
-    if result.status == PreflightStatus.WARNING:
-        log_fn = logger.warning
-    elif result.status == PreflightStatus.FAILED:
-        log_fn = logger.error
+    log_fn = logger.info if result.status else logger.error
     
     log_fn(
-        f"{icon} Preflight: {result.status.value.upper()} | "
+        f"{icon} Preflight: {status_text} | "
         f"{result.required_gb:.1f}GB required, {result.available_gb:.1f}GB available "
         f"({result.utilization*100:.0f}%) | "
-        f"max_context={result.max_context:,}, recommended={result.recommended_context:,}"
+        f"context_limit={result.context_limit:,}, usable={result.usable_context:,}"
     )
 
 
@@ -589,210 +205,126 @@ def _make_decision(
     utilization: float,
     estimate: MemoryEstimate,
     metadata: ModelMetadata,
-    requested_context: int,
+    model_context_limit: int,
     max_safe_context: int,
     available_gb: float,
-    mem_type: str
+    mem_type: str,
+    max_utilization: float = WARNING_THRESHOLD,
+    min_context: int = MIN_VIABLE_CONTEXT
 ) -> PreflightResult:
     """
     Make validation decision based on utilization and context.
     
+    Algorithm:
+    1. Try full context first (always respect model design)
+    2. If doesn't fit AND model < min_context: reject immediately (no reduction)
+    3. If doesn't fit AND model >= min_context: calculate reduced context targeting max_utilization
+    4. If reduced context < min_context: reject
+    5. Otherwise: PASS with context info (user decides if acceptable)
+    
     Args:
-        utilization: Memory utilization ratio (required / available)
-        estimate: Memory estimate breakdown
+        utilization: Memory utilization ratio at full context (required / available)
+        estimate: Memory estimate breakdown at full context
         metadata: Model metadata
-        requested_context: User-requested context length
+        model_context_limit: Model's designed maximum context
         max_safe_context: Maximum safe context we calculated
         available_gb: Available memory in GB
         mem_type: Memory type description
+        max_utilization: Target utilization threshold (default 0.85)
+        min_context: Minimum viable context threshold (default 4096)
         
     Returns:
-        ValidationResult with appropriate status
+        PreflightResult with appropriate status
     """
     result: PreflightResult
     
-    # Check if model fits at all
-    if utilization > 1.0:
+    # Calculate base memory (weights + overhead only, no KV cache)
+    base_memory_gb = estimate.weights_gb + estimate.overhead_gb
+    base_utilization = base_memory_gb / available_gb
+    
+    # SCENARIO 1: Model base is too large even with zero context
+    if base_utilization > max_utilization:
         result = PreflightResult(
-            status=PreflightStatus.FAILED,
-            message=_format_critical_message(
-                estimate=estimate,
+            status=False,
+            reason=PreflightReason.MEMORY_EXCEEDED,
+            required_gb=base_memory_gb,
                 available_gb=available_gb,
-                mem_type=mem_type,
-                reason="Model requirements exceed available memory"
-            ),
-            required_gb=estimate.total_required_gb,
-            available_gb=available_gb,
-            utilization=utilization,
-            requested_context=requested_context,
-            max_context=max_safe_context,
+            utilization=base_utilization,
+            context_limit=model_context_limit,
+            usable_context=0,
             estimate=estimate
         )
+        _log_preflight_result(result)
+        return result
     
-    # Check if max context is viable
-    elif max_safe_context < MIN_VIABLE_CONTEXT:
+    # Check if model fits at full designed context
+    if utilization <= max_utilization:
+        # Model fits at full context!
         result = PreflightResult(
-            status=PreflightStatus.FAILED,
-            message=_format_critical_message(
-                estimate=estimate,
-                available_gb=available_gb,
-                mem_type=mem_type,
-                reason=f"Maximum safe context ({max_safe_context:,}) is below minimum viable ({MIN_VIABLE_CONTEXT:,})"
-            ),
+            status=True,
+            reason=PreflightReason.FULL_CONTEXT,
             required_gb=estimate.total_required_gb,
             available_gb=available_gb,
             utilization=utilization,
-            requested_context=requested_context,
-            max_context=max_safe_context,
+            context_limit=model_context_limit,
+            usable_context=model_context_limit,  # Full context!
             estimate=estimate
         )
+        _log_preflight_result(result)
+        return result
     
-    # Check thresholds
-    elif utilization > WARNING_THRESHOLD:
-        # Need to constrain context
-        recommended_context = int(max_safe_context * 0.8)  # Conservative
+    # Model doesn't fit at full context - check if reduction is viable
+    
+    # Special case: Sub-min_context models cannot be reduced further
+    if model_context_limit < min_context:
         result = PreflightResult(
-            status=PreflightStatus.WARNING,
-            message=_format_warning_message(
-                estimate=estimate,
-                max_context=max_safe_context,
-                recommended_context=recommended_context,
-                mem_type=mem_type
-            ),
+            status=False,
+            reason=PreflightReason.CONTEXT_INSUFFICIENT,
             required_gb=estimate.total_required_gb,
             available_gb=available_gb,
             utilization=utilization,
-            requested_context=requested_context,
-            recommended_context=recommended_context,
-            max_context=max_safe_context,
+            context_limit=model_context_limit,
+            usable_context=0,
             estimate=estimate
         )
+        _log_preflight_result(result)
+        return result
     
-    elif utilization > SAFE_THRESHOLD:
-        # Mild warning but can proceed
+    # Calculate reduced context targeting max_utilization
+    target_memory_gb = available_gb * max_utilization
+    kv_budget_at_target = target_memory_gb - base_memory_gb
+    
+    # Calculate what context achieves the target utilization
+    context_at_target = calculate_max_safe_context(kv_budget_at_target, metadata, safety_factor=1.0)
+    
+    # Check if reduced context meets minimum viability
+    if context_at_target < min_context:
         result = PreflightResult(
-            status=PreflightStatus.WARNING,
-            message=f"Model will use {utilization*100:.0f}% of available {mem_type}. "
-                   f"Consider closing other applications for best performance.",
+            status=False,
+            reason=PreflightReason.CONTEXT_INSUFFICIENT,
             required_gb=estimate.total_required_gb,
             available_gb=available_gb,
             utilization=utilization,
-            requested_context=requested_context,
-            recommended_context=requested_context,
-            max_context=max_safe_context,
+            context_limit=model_context_limit,
+            usable_context=0,
             estimate=estimate
         )
+        _log_preflight_result(result)
+        return result
     
-    else:
-        # Safe to proceed
+    # Model can run with reduced context
         result = PreflightResult(
-            status=PreflightStatus.PASSED,
-            message=f"Memory validation passed ({utilization*100:.0f}% utilization)",
-            required_gb=estimate.total_required_gb,
+        status=True,
+        reason=PreflightReason.REDUCED_CONTEXT,
+        required_gb=target_memory_gb,
             available_gb=available_gb,
-            utilization=utilization,
-            requested_context=requested_context,
-            recommended_context=requested_context,
-            max_context=max_safe_context,
+        utilization=max_utilization,
+        context_limit=model_context_limit,
+        usable_context=context_at_target,
             estimate=estimate
         )
-    
-    # Log and return
     _log_preflight_result(result)
     return result
-
-
-# ============================================================================
-# MESSAGE FORMATTING
-# ============================================================================
-
-# =============================================================================
-# MESSAGE TEMPLATES
-# =============================================================================
-
-CRITICAL_MESSAGE_TEMPLATE = """
-======================================================================
-MEMORY VALIDATION FAILED
-======================================================================
-
-Model: {quantization} quantization, {params}B parameters
-
-Memory Requirements:
-  Model weights:    {weights_gb:>6.1f} GB
-  KV cache:         {kv_cache_gb:>6.1f} GB
-  System overhead:  {overhead_gb:>6.1f} GB
-  -------------------------
-  Total required:   {total_required_gb:>6.1f} GB
-
-Available {mem_type}: {available_gb:.1f} GB
-
-Reason: {reason}
-
-Suggestions:
-  - Use a smaller model (7B or 14B parameters)
-  - Try higher quantization (3-bit instead of 4-bit)
-  - Reduce context window if possible
-  - Close other applications to free memory
-
-======================================================================"""
-
-WARNING_MESSAGE_TEMPLATE = """
-------------------------------------------------------------
-MEMORY VALIDATION WARNING
-------------------------------------------------------------
-
-Model will load with constrained context window:
-
-  Available {mem_type}: {available_gb:.1f} GB
-  Model requirements:   {total_required_gb:.1f} GB
-
-  Maximum safe context:   {max_safe_context} tokens
-  Recommended context:    {recommended_context} tokens
-
-The model will be loaded with the recommended context limit.
-This is sufficient for most agent tasks but may require
-summarization for very long documents.
-
-Close other applications for best performance.
-{extra_note}
-------------------------------------------------------------"""
-
-SAFE_MESSAGE_TEMPLATE = "Model can load safely with up to {max_safe_context} token context.{extra_note}"
-
-
-def _format_critical_message(estimate: MemoryEstimate, available_gb: float, mem_type: str, reason: str) -> str:
-    """Format a critical (blocking) error message."""
-    return CRITICAL_MESSAGE_TEMPLATE.format(
-        quantization=estimate.quantization or 'unknown',
-        params=estimate.params_billions or 'unknown',
-        weights_gb=estimate.weights_gb,
-        kv_cache_gb=estimate.kv_cache_gb,
-        overhead_gb=estimate.overhead_gb,
-        total_required_gb=estimate.total_required_gb,
-        mem_type=mem_type,
-        available_gb=available_gb,
-        reason=reason
-    )
-
-
-def _format_warning_message(estimate: MemoryEstimate, max_safe_context: int, recommended_context: int, mem_type: str, extra_note: str = None) -> str:
-    """Format a warning message for constrained context."""
-    return WARNING_MESSAGE_TEMPLATE.format(
-        mem_type=mem_type,
-        available_gb=estimate.available_gb,
-        total_required_gb=estimate.total_required_gb,
-        max_safe_context=f"{max_safe_context:,}",
-        recommended_context=f"{recommended_context:,}",
-        extra_note=f"\nNote: {extra_note}" if extra_note else ""
-    )
-
-
-def _format_safe_message(max_safe_context: int, extra_note: str = None) -> str:
-    """Format a safe validation message."""
-    return SAFE_MESSAGE_TEMPLATE.format(
-        max_safe_context=f"{max_safe_context:,}",
-        extra_note=f" Note: {extra_note}" if extra_note else ""
-    )
 
 
 # ============================================================================
@@ -870,20 +402,33 @@ def _inspect_local(model_path: str, model_id: str, engine: Engine) -> ModelMetad
 # METADATA-BASED VALIDATION
 # ============================================================================
 
-def _validate_gguf_with_metadata(metadata: ModelMetadata) -> PreflightResult:
+def _validate_gguf_with_metadata(
+    metadata: ModelMetadata,
+    max_utilization: float = WARNING_THRESHOLD,
+    min_context: int = MIN_VIABLE_CONTEXT
+) -> PreflightResult:
     """Validate GGUF model using pre-extracted metadata."""
     try:
-        # Determine context length
-        context = metadata.model_max_context or DEFAULT_CONTEXT
+        # Check required metadata
+        if not metadata.model_max_context:
+            return PreflightResult(
+                status=False,
+                reason=PreflightReason.VALIDATION_FAILED,
+                context_limit=0,
+                usable_context=0
+            )
+        
+        context = metadata.model_max_context
         
         # Get available memory
         available_gb, mem_type = get_available_memory("llama_cpp")
         
         if available_gb <= 0:
             return PreflightResult(
-                status=PreflightStatus.UNKNOWN,
-                message="Could not determine available memory",
-                recommended_context=context
+                status=False,
+                reason=PreflightReason.VALIDATION_FAILED,
+                context_limit=context,
+                usable_context=0
             )
         
         # Calculate memory requirements
@@ -897,16 +442,13 @@ def _validate_gguf_with_metadata(metadata: ModelMetadata) -> PreflightResult:
         kv_budget = available_gb - estimate.weights_gb - estimate.overhead_gb
         if kv_budget <= 0:
             return PreflightResult(
-                status=PreflightStatus.FAILED,
-                message=_format_critical_message(
-                    estimate=estimate,
-                    available_gb=available_gb,
-                    mem_type=mem_type,
-                    reason="Model weights and overhead alone exceed available memory"
-                ),
+                status=False,
+                reason=PreflightReason.MEMORY_EXCEEDED,
                 required_gb=estimate.total_required_gb,
                 available_gb=available_gb,
                 utilization=utilization,
+                context_limit=context,
+                usable_context=0,
                 estimate=estimate
             )
         max_safe_context = calculate_max_safe_context(kv_budget, metadata)
@@ -916,39 +458,72 @@ def _validate_gguf_with_metadata(metadata: ModelMetadata) -> PreflightResult:
             utilization=utilization,
             estimate=estimate,
             metadata=metadata,
-            requested_context=context,
+            model_context_limit=context,
             max_safe_context=max_safe_context,
             available_gb=available_gb,
-            mem_type=mem_type
+            mem_type=mem_type,
+            max_utilization=max_utilization,
+            min_context=min_context
         )
         
     except Exception as e:
         return PreflightResult(
-            status=PreflightStatus.UNKNOWN,
-            message=f"Memory validation failed: {e}",
-            recommended_context=DEFAULT_CONTEXT
+            status=False,
+            reason=PreflightReason.VALIDATION_FAILED,
+            context_limit=metadata.model_max_context or 0,
+            usable_context=0
         )
 
 
-def _validate_mlx_with_metadata(metadata: ModelMetadata) -> PreflightResult:
+def _validate_mlx_with_metadata(
+    metadata: ModelMetadata,
+    max_utilization: float = WARNING_THRESHOLD,
+    min_context: int = MIN_VIABLE_CONTEXT
+) -> PreflightResult:
     """Validate MLX model using pre-extracted metadata."""
     try:
-        # Determine context length
-        context = metadata.model_max_context or DEFAULT_CONTEXT
+        print(f"\n🔧 DEBUG: MLX Memory Validation")
+        print(f"   Model Type: {metadata.model_type}")
+        if metadata.params_billions:
+            print(f"   Params: {metadata.params_billions:.1f}B")
+        print(f"   Quantization: {metadata.quantization_type or 'unknown'}")
+        print(f"   BPW: {metadata.bits_per_weight}")
+        
+        # Check required metadata
+        if not metadata.model_max_context:
+            print(f"❌ DEBUG: Missing model_max_context")
+            return PreflightResult(
+                status=False,
+                reason=PreflightReason.VALIDATION_FAILED,
+                context_limit=0,
+                usable_context=0
+            )
+        
+        context = metadata.model_max_context
+        print(f"   Context: {context:,}")
         
         # Get available memory
+        print(f"   Getting available memory...")
         available_gb, mem_type = get_available_memory("mlx_lm")
+        print(f"   Available: {available_gb:.2f} GB ({mem_type})")
         
         if available_gb <= 0:
+            print(f"❌ DEBUG: Available memory is {available_gb} GB - returning UNKNOWN")
             return PreflightResult(
-                status=PreflightStatus.UNKNOWN,
-                message="Could not determine available memory",
-                recommended_context=context
+                status=False,
+                reason=PreflightReason.VALIDATION_FAILED,
+                context_limit=context,
+                usable_context=0
             )
         
         # Calculate memory requirements
+        print(f"   Calculating memory estimate...")
         estimate = estimate_mlx_memory(metadata, context)
         estimate.available_gb = available_gb
+        print(f"   Weights: {estimate.weights_gb:.2f} GB")
+        print(f"   KV Cache: {estimate.kv_cache_gb:.2f} GB")
+        print(f"   Overhead: {estimate.overhead_gb:.2f} GB")
+        print(f"   Total Required: {estimate.total_required_gb:.2f} GB")
         
         # Calculate utilization
         utilization = estimate.total_required_gb / available_gb
@@ -957,16 +532,13 @@ def _validate_mlx_with_metadata(metadata: ModelMetadata) -> PreflightResult:
         kv_budget = available_gb - estimate.weights_gb - estimate.overhead_gb
         if kv_budget <= 0:
             return PreflightResult(
-                status=PreflightStatus.FAILED,
-                message=_format_critical_message(
-                    estimate=estimate,
-                    available_gb=available_gb,
-                    mem_type=mem_type,
-                    reason="Model weights and overhead exceed available unified memory"
-                ),
+                status=False,
+                reason=PreflightReason.MEMORY_EXCEEDED,
                 required_gb=estimate.total_required_gb,
                 available_gb=available_gb,
                 utilization=utilization,
+                context_limit=context,
+                usable_context=0,
                 estimate=estimate
             )
         max_safe_context = calculate_max_safe_context(kv_budget, metadata)
@@ -976,32 +548,53 @@ def _validate_mlx_with_metadata(metadata: ModelMetadata) -> PreflightResult:
             utilization=utilization,
             estimate=estimate,
             metadata=metadata,
-            requested_context=context,
+            model_context_limit=context,
             max_safe_context=max_safe_context,
             available_gb=available_gb,
-            mem_type=mem_type
+            mem_type=mem_type,
+            max_utilization=max_utilization,
+            min_context=min_context
         )
         
     except Exception as e:
+        print(f"❌ DEBUG: Exception in MLX validation: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
         return PreflightResult(
-            status=PreflightStatus.UNKNOWN,
-            message=f"Memory validation failed: {e}",
-            recommended_context=DEFAULT_CONTEXT
+            status=False,
+            reason=PreflightReason.VALIDATION_FAILED,
+            context_limit=metadata.model_max_context or 0,
+            usable_context=0
         )
 
 
-def _validate_vllm_with_metadata(metadata: ModelMetadata) -> PreflightResult:
+def _validate_vllm_with_metadata(
+    metadata: ModelMetadata,
+    max_utilization: float = WARNING_THRESHOLD,
+    min_context: int = MIN_VIABLE_CONTEXT
+) -> PreflightResult:
     """Validate vLLM model using pre-extracted metadata."""
     try:
+        # Check required metadata
+        if not metadata.model_max_context:
+            return PreflightResult(
+                status=False,
+                reason=PreflightReason.VALIDATION_FAILED,
+                context_limit=0,
+                usable_context=0
+            )
+        
         # Get available VRAM
         available_gb, mem_type = get_available_memory("vllm")
         
         if available_gb <= 0:
             return PreflightResult(
-                status=PreflightStatus.FAILED,
-                message="No NVIDIA GPU detected. vLLM requires a CUDA-capable GPU.",
+                status=False,
+                reason=PreflightReason.VALIDATION_FAILED,
                 required_gb=0,
-                available_gb=0
+                available_gb=0,
+                context_limit=metadata.model_max_context,
+                usable_context=0
             )
         
         # Stage 1: Can it load?
@@ -1012,96 +605,89 @@ def _validate_vllm_with_metadata(metadata: ModelMetadata) -> PreflightResult:
         
         if load_required > available_gb:
             return PreflightResult(
-                status=PreflightStatus.FAILED,
-                message=_format_critical_message(
-                    estimate=estimate,
-                    available_gb=available_gb,
-                    mem_type=mem_type,
-                    reason="Model weights and overhead exceed available GPU memory"
-                ),
+                status=False,
+                reason=PreflightReason.MEMORY_EXCEEDED,
                 required_gb=load_required,
                 available_gb=available_gb,
+                context_limit=metadata.model_max_context,
+                usable_context=0,
                 estimate=estimate
             )
         
-        # Stage 2: How much context?
+        # Stage 2: Calculate context that fits in remaining space
+        # vLLM uses PagedAttention to dynamically allocate context
+        context = metadata.model_max_context
         kv_budget = available_gb - load_required
         max_safe_context = calculate_max_safe_context(kv_budget, metadata)
         estimate.max_safe_context = max_safe_context
         
-        if max_safe_context < MIN_VIABLE_CONTEXT:
-            return PreflightResult(
-                status=PreflightStatus.FAILED,
-                message=_format_critical_message(
-                    estimate=estimate,
-                    available_gb=available_gb,
-                    mem_type=mem_type,
-                    reason=f"Maximum safe context ({max_safe_context:,}) is below minimum viable ({MIN_VIABLE_CONTEXT:,})"
-                ),
-                required_gb=load_required,
-                available_gb=available_gb,
-                max_context=max_safe_context,
-                estimate=estimate
+        # For vLLM, we already know weights fit (Stage 1 passed)
+        # Now calculate full memory with a reasonable context
+        # Use the target context to get accurate utilization
+        from .memory_estimator import calculate_kv_cache_gb
+        kv_lora_rank = getattr(metadata, 'kv_lora_rank', None)
+        
+        if all([metadata.num_layers, metadata.num_kv_heads, metadata.head_dim]) or kv_lora_rank:
+            if not metadata.num_layers:
+                raise PreflightValidationError("Cannot calculate KV cache - missing num_layers")
+            if not kv_lora_rank and (not metadata.num_kv_heads or not metadata.head_dim):
+                raise PreflightValidationError("Cannot calculate KV cache - missing num_kv_heads or head_dim")
+            
+            from .memory_estimator import KV_DTYPE_FP16
+            kv_cache_gb = calculate_kv_cache_gb(
+                num_layers=metadata.num_layers,
+                num_kv_heads=metadata.num_kv_heads,
+                head_dim=metadata.head_dim,
+                context_length=context,
+                dtype_bytes=KV_DTYPE_FP16,
+                kv_lora_rank=kv_lora_rank
             )
+            estimate.kv_cache_gb = kv_cache_gb
+            estimate.total_required_gb = load_required + kv_cache_gb
         
-        # Calculate utilization for the full recommended context
-        utilization = load_required / available_gb
-        recommended_context = int(max_safe_context * 0.8)  # Conservative
+        utilization = estimate.total_required_gb / available_gb
         
-        if utilization > WARNING_THRESHOLD:
-            return PreflightResult(
-                status=PreflightStatus.WARNING,
-                message=_format_warning_message(
-                    estimate=estimate,
-                    max_context=max_safe_context,
-                    recommended_context=recommended_context,
-                    mem_type=mem_type,
-                    extra_note="vLLM reserves 90% of VRAM by default."
-                ),
-                required_gb=load_required,
-                available_gb=available_gb,
-                utilization=utilization,
-                max_context=max_safe_context,
-                recommended_context=recommended_context,
-                estimate=estimate
-            )
-        
-        return PreflightResult(
-            status=PreflightStatus.PASSED,
-            message=_format_safe_message(
-                max_context=max_safe_context,
-                extra_note="vLLM reserves 90% of VRAM by default."
-            ),
-            required_gb=load_required,
-            available_gb=available_gb,
+        # Use standard decision logic like other backends
+        return _make_decision(
             utilization=utilization,
-            max_context=max_safe_context,
-            recommended_context=recommended_context,
-            estimate=estimate
+                    estimate=estimate,
+            metadata=metadata,
+            model_context_limit=context,
+            max_safe_context=max_safe_context,
+                available_gb=available_gb,
+            mem_type=mem_type,
+            max_utilization=max_utilization,
+            min_context=min_context
         )
         
     except Exception as e:
         return PreflightResult(
-            status=PreflightStatus.UNKNOWN,
-            message=f"Memory validation failed: {e}",
-            recommended_context=DEFAULT_CONTEXT
+            status=False,
+            reason=PreflightReason.VALIDATION_FAILED,
+            context_limit=metadata.model_max_context or 0,
+            usable_context=0
         )
 
 
-def _validate_with_metadata(metadata: ModelMetadata, engine: Engine) -> PreflightResult:
+def _validate_with_metadata(
+    metadata: ModelMetadata, 
+    engine: Engine,
+    max_utilization: float = WARNING_THRESHOLD,
+    min_context: int = MIN_VIABLE_CONTEXT
+) -> PreflightResult:
     """
     Validate memory using pre-extracted metadata.
     
     Dispatches to the appropriate engine-specific validator.
     """
     if engine == "llama_cpp":
-        return _validate_gguf_with_metadata(metadata)
-    elif engine == "mlx":
-        return _validate_mlx_with_metadata(metadata)
+        return _validate_gguf_with_metadata(metadata, max_utilization, min_context)
+    elif engine == "mlx_lm":
+        return _validate_mlx_with_metadata(metadata, max_utilization, min_context)
     elif engine == "vllm":
-        return _validate_vllm_with_metadata(metadata)
+        return _validate_vllm_with_metadata(metadata, max_utilization, min_context)
     else:
-        raise ValueError(f"Invalid engine: {engine}")
+        raise PreflightValidationError(f"Invalid engine: {engine}")
 
 
 # ============================================================================
@@ -1110,7 +696,9 @@ def _validate_with_metadata(metadata: ModelMetadata, engine: Engine) -> Prefligh
 
 def model_preflight(
     model_id: str,
-    engine: Engine
+    engine: Engine,
+    max_utilization: float = WARNING_THRESHOLD,
+    min_context: int = MIN_VIABLE_CONTEXT
 ) -> PreflightResult:
     """
     Run preflight check to determine if a model will fit in memory.
@@ -1128,7 +716,13 @@ def model_preflight(
     Args:
         model_id: HuggingFace repo ID (e.g., "mlx-community/Llama-3-8B-4bit")
                   or local path (e.g., "/path/to/model.gguf" or "/path/to/model/")
-        engine: Inference engine - "mlx", "llama_cpp", or "vllm"
+        engine: Inference engine - "mlx_lm", "llama_cpp", or "vllm"
+        max_utilization: Target memory utilization threshold (0.0-1.0).
+                        Models exceeding this will be rejected or context-reduced.
+                        Default: 0.85 (85%)
+        min_context: Minimum viable context length in tokens.
+                    Models requiring less than this will be rejected.
+                    Default: 4096 tokens
         
     Returns:
         PreflightResult with status and recommendations
@@ -1136,22 +730,26 @@ def model_preflight(
     Examples:
         >>> from edgekit.models import model_preflight
         >>> 
-        >>> # Option 1: HuggingFace repo ID (uses lightweight remote check)
-        >>> result = model_preflight("mlx-community/Llama-3-8B-4bit", engine="mlx")
+        >>> # Basic usage with defaults
+        >>> result = model_preflight("mlx-community/Llama-3-8B-4bit", engine="mlx_lm")
         >>> 
-        >>> # Option 2: Local path (direct file inspection)
-        >>> result = model_preflight("/path/to/model.gguf", engine="llama_cpp")
+        >>> # Conservative: only use 70% of memory
+        >>> result = model_preflight(model_id, engine="mlx_lm", max_utilization=0.70)
         >>> 
-        >>> if result.can_load:
-        ...     print(f"Use context: {result.recommended_context}")
+        >>> # Power user: accept lower context, push memory to 95%
+        >>> result = model_preflight(model_id, engine="mlx_lm", 
+        ...                          max_utilization=0.95, min_context=2048)
+        >>> 
+        >>> if result.status:
+        ...     print(f"Model: {result.context_limit}, Device: {result.usable_context}")
         >>> else:
-        ...     print(f"Won't fit: {result.message}")
+        ...     print(f"Won't fit: {result.reason}")
     """
     # Validate engine
-    if engine not in ("mlx", "llama_cpp", "vllm"):
-        raise ValueError(
+    if engine not in ("mlx_lm", "llama_cpp", "vllm"):
+        raise PreflightValidationError(
             f"Invalid engine: '{engine}'. "
-            f"Must be one of: 'mlx', 'llama_cpp', or 'vllm'"
+            f"Must be one of: 'mlx_lm', 'llama_cpp', or 'vllm'"
         )
     
     # Check if it's a local path
@@ -1159,21 +757,31 @@ def model_preflight(
         # Local path: use direct inspection
         model_path, display_name = _resolve_model_path(model_id, engine)
         metadata = _inspect_local(model_path, display_name, engine)
-        return _validate_with_metadata(metadata, engine)
+        return _validate_with_metadata(metadata, engine, max_utilization, min_context)
     
     # Remote HuggingFace repo: try lightweight inspection first
     try:
+        print(f"🔍 DEBUG: Attempting lightweight remote inspection for {model_id}")
         logger.debug(f"Attempting lightweight remote inspection for {model_id}")
         metadata = inspect_model_remote(model_id, engine)
+        print(f"✅ DEBUG: Remote inspection succeeded!")
+        print(f"   Model Type: {metadata.model_type}")
+        print(f"   Quantization: {metadata.quantization_type or 'unknown'}")
+        if metadata.params_billions:
+            print(f"   Params: {metadata.params_billions:.1f}B")
+        print(f"   Layers: {metadata.num_layers or 'unknown'}")
+        print(f"   Context: {metadata.model_max_context or 'unknown'}")
         logger.debug(f"Remote inspection succeeded: {metadata}")
-        return _validate_with_metadata(metadata, engine)
+        return _validate_with_metadata(metadata, engine, max_utilization, min_context)
         
     except RemoteInspectError as e:
         # Light check failed, fall back to full download
+        print(f"⚠️  DEBUG: Light check failed: {e}")
+        print(f"   Falling back to full download...")
         logger.info(f"Light check unavailable ({e}), downloading for inspection")
         model_path, display_name = _resolve_model_path(model_id, engine)
         metadata = _inspect_local(model_path, display_name, engine)
-        return _validate_with_metadata(metadata, engine)
+        return _validate_with_metadata(metadata, engine, max_utilization, min_context)
 
 
 def can_load(
@@ -1188,7 +796,7 @@ def can_load(
     
     Args:
         model_id: HuggingFace repo ID or local path
-        engine: Inference engine - "mlx", "llama_cpp", or "vllm"
+        engine: Inference engine - "mlx_lm", "llama_cpp", or "vllm"
         
     Returns:
         True if model can load, False otherwise
@@ -1197,7 +805,7 @@ def can_load(
         >>> from edgekit.models import can_load
         >>> 
         >>> # Check HuggingFace model
-        >>> if can_load("mlx-community/Llama-3-8B-4bit", engine="mlx"):
+        >>> if can_load("mlx-community/Llama-3-8B-4bit", engine="mlx_lm"):
         ...     load_the_model()
         >>> 
         >>> # Check local model
@@ -1205,5 +813,5 @@ def can_load(
         ...     load_the_model()
     """
     result = model_preflight(model_id, engine)
-    return result.can_load
+    return result.status
 

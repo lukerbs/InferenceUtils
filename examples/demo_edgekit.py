@@ -13,8 +13,8 @@ print(f"Reason: {engine.reason}")
 print(f"Install: pip install {' '.join(engine.dependencies)}")
 
 # Example: Validate if a model will fit in memory
-result = model_preflight("mlx-community/Llama-3-8B-4bit", engine="mlx")
-if result.can_load:
-    print(f"\n✓ Model will fit: {result.recommended_context:,} tokens")
+result = model_preflight("mlx-community/gemma-3n-E4B-it-lm-4bit", engine="mlx_lm")
+if result.status:
+    print(f"\n✓ Model will run: {result.usable_context:,} tokens")
 else:
-    print(f"\n✗ Model won't fit: {result.message}")
+    print(f"\n✗ Model won't fit: {result.reason}")
