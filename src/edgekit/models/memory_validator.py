@@ -313,16 +313,16 @@ def _make_decision(
         return result
     
     # Model can run with reduced context
-        result = PreflightResult(
+    result = PreflightResult(
         status=True,
         reason=PreflightReason.REDUCED_CONTEXT,
         required_gb=target_memory_gb,
-            available_gb=available_gb,
+        available_gb=available_gb,
         utilization=max_utilization,
         context_limit=model_context_limit,
         usable_context=context_at_target,
-            estimate=estimate
-        )
+        estimate=estimate
+    )
     _log_preflight_result(result)
     return result
 

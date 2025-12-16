@@ -81,12 +81,12 @@ For a deeper discussion of these problems and how EdgeKit approaches them, see [
 ## Installation
 
 ```bash
-# From PyPI (once published)
-pip install edgekit
+# From source (GitHub)
+pip install git+https://github.com/lukerbs/InferenceUtils.git
 
-# From source
-git clone https://github.com/yourusername/EdgeKit.git
-cd EdgeKit
+# Or clone and install locally
+git clone https://github.com/lukerbs/InferenceUtils.git
+cd InferenceUtils
 pip install -e .
 ```
 
