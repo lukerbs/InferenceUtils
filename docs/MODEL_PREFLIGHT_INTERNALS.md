@@ -1,7 +1,7 @@
 # Model Preflight Internals
 
 > **Internal Documentation** — For EdgeKit maintainers and contributors.  
-> Last updated: December 2024 (Updated for v1.0 - 6-Phase Refactor)
+> Last updated: January 2025 (Removed overhead calculations, simplified to single 85% utilization cap)
 
 This document explains how EdgeKit inspects models, estimates memory requirements, and validates preflight checks before loading. It covers the **how** (implementation approach), the **why** (rationale for design decisions), and **format-specific considerations & nuances** that aren't immediately obvious.
 
@@ -20,7 +20,6 @@ This document explains how EdgeKit inspects models, estimates memory requirement
 3. [Memory Estimation](#memory-estimation)
    - [Weight Memory](#weight-memory)
    - [KV Cache Memory](#kv-cache-memory)
-   - [Activation Overhead](#activation-overhead)
    - [DeepSeek MLA (Compressed KV)](#deepseek-mla-compressed-kv)
 4. [Quantization Maps](#quantization-maps)
    - [GGUF K-Quants](#gguf-k-quants)
@@ -48,7 +47,7 @@ The `edgekit.models` module exports:
 - **`inspect_model_remote(model_id, engine)`** — Low-level remote metadata extraction (raises `RemoteInspectError` on failure)
 - **`PreflightResult`** — Dataclass with boolean `status` and structured `reason` enum
 - **`ModelMetadata`** — Dataclass containing extracted model architecture parameters
-- **`MemoryEstimate`** — Dataclass with weights/KV cache/overhead breakdown
+- **`MemoryEstimate`** — Dataclass with weights/KV cache breakdown
 
 ---
 
@@ -65,7 +64,7 @@ EdgeKit solves this with a multi-layered approach:
 
 1. **Remote Inspection**: Extract metadata via HTTP Range requests (~500KB instead of 40GB)
 2. **Local Inspection**: Parse headers from cached/downloaded model files
-3. **Memory Estimation**: Calculate weights + KV cache + overhead based on architecture
+3. **Memory Estimation**: Calculate weights + KV cache based on architecture
 4. **Preflight Validation**: Compare requirements against available hardware memory
 
 ### The "Light Check First, Full Download Fallback" Strategy
@@ -249,7 +248,7 @@ The `config.json`-first approach ensures we interpret weights correctly regardle
 
 - **Unified memory budget**: MLX runs on Apple Silicon unified memory. The same RAM pool serves CPU, GPU, and Neural Engine. We account for this in hardware detection.
 
-- **Wiring spike**: MLX graph compilation creates a temporary memory spike (~15% overhead). We add this to activation overhead estimates.
+- **Graph compilation**: MLX graph compilation creates a temporary memory spike during initialization. The 15% safety buffer (85% utilization cap) provides sufficient headroom for this and other runtime variability.
 
 ---
 
@@ -287,7 +286,7 @@ When parsing, we:
 
 ## Memory Estimation
 
-Memory estimation calculates the total memory footprint as the sum of **Weights + KV Cache + Overhead**.
+Memory estimation calculates the total memory footprint as the sum of **Weights + KV Cache**. A single 85% utilization cap (15% safety buffer) provides sufficient headroom for framework overhead, memory fragmentation, and runtime variability.
 
 ### Weight Memory
 
@@ -359,26 +358,16 @@ The default is FP16 (2 bytes per element), but some configurations support quant
 
 ---
 
-### Activation Overhead
+### Safety Buffer
 
-Activation overhead accounts for runtime memory beyond weights and KV cache:
-- Scratch buffers for matrix multiplication
-- Intermediate activation tensors
-- Runtime overhead (Python, CUDA context)
-- Graph compilation (MLX)
+Rather than calculating explicit overhead (scratch buffers, intermediate activations, runtime overhead, graph compilation), we use a **single 85% utilization cap** as a safety buffer. This 15% headroom accounts for:
 
-#### Tiered Overhead
+- Framework overhead (scratch buffers, intermediate activations)
+- Memory fragmentation
+- OS memory management
+- Runtime variability (graph compilation spikes, CUDA context)
 
-We use fixed tiers based on model size (empirically validated):
-
-| Model Size | Base Overhead |
-|------------|---------------|
-| < 10B params | 1.2 GB |
-| 10-30B params | 2.5 GB |
-| 30B+ params | 4.0 GB |
-| MoE (any size) | 3.0 GB |
-
-For MLX, we add 15% for graph compilation ("wiring") spike by multiplying the base overhead by 1.15.
+This approach is simpler, more accurate, and avoids double-counting safety margins. The OS-reported available memory already excludes system overhead, kernel memory, and running processes, so the 15% buffer provides sufficient headroom without being overly conservative.
 
 ---
 
@@ -598,7 +587,7 @@ The `PreflightResult` dataclass provides structured validation results:
 - When `usable_context == 0`: Model cannot fit (status=False)
 
 **Detailed breakdown:**
-- `.estimate` — `MemoryEstimate` object with weights/kv/overhead split
+- `.estimate` — `MemoryEstimate` object with weights/kv cache breakdown
 
 ### Backend-Specific Validation
 
@@ -610,8 +599,8 @@ Each inference backend has different memory characteristics.
 - **Detection method**: macOS Mach VM API (`host_statistics64`)
 - **Available memory**: Free + speculative + external (file-backed) pages
   - Excludes: Wired memory, compressed memory, active app memory, WindowServer
-- **Overhead accounting**: Graph compilation ("wiring") adds ~15% temporary spike (included in activation overhead estimate)
-- **No additional buffers**: OS-reported available memory is used directly
+- **Safety buffer**: The 15% headroom (85% utilization cap) accounts for graph compilation spikes and other runtime variability
+- **No additional buffers**: OS-reported available memory is used directly with the single 85% utilization cap
 
 The Mach VM API provides instant-reclaimable memory. System overhead, kernel, and running applications are already excluded from the available count.
 
@@ -633,17 +622,17 @@ All platforms provide conservative available memory estimates that already accou
 - **Detection method**: NVML (NVIDIA Management Library)
 - **Available VRAM**: Reported by driver (accounts for ECC overhead if enabled)
 - **Two-stage validation**:
-  1. **Stage 1**: Can weights + overhead fit in VRAM?
+  1. **Stage 1**: Can weights fit in VRAM? (vLLM's 90% reservation is accounted for in weight estimation)
   2. **Stage 2**: How much context fits in remaining space?
 - **PagedAttention**: Fills remaining VRAM with KV blocks dynamically
-- **Default behavior**: vLLM reserves 90% of VRAM (`gpu_memory_utilization=0.9`)
-- **CUDA overhead**: ~0.5GB for NCCL/PyTorch context (included in activation overhead estimate)
+- **Default behavior**: vLLM reserves 90% of VRAM (`gpu_memory_utilization=0.9`), which is accounted for in weight estimation
+- **Safety buffer**: The 15% headroom (85% utilization cap) accounts for CUDA context, NCCL overhead, and other runtime variability
 
 The 85% utilization threshold works the same across all backends, providing consistent validation. Models that fit within this threshold return status=True, those exceeding it return status=False.
 
 ### Context Length Calculation
 
-When full context doesn't fit, we calculate the maximum safe context by first computing the **KV budget** (available memory minus weights and overhead), then dividing by **bytes per token**.
+When full context doesn't fit, we calculate the maximum safe context by first computing the **KV budget** (available memory × 85% minus weights), then dividing by **bytes per token**.
 
 **Bytes per token calculation:**
 - **Standard attention**: 2 × layers × kv_heads × head_dim × dtype_bytes
@@ -672,6 +661,5 @@ Areas identified for potential future enhancement:
 
 - **Expert offloading for MoE**: Large MoE models (Mixtral 8x22B) can offload inactive experts to CPU. Memory requirements could be adjusted for this mode.
 
-- **Dynamic overhead profiling**: Replace fixed overhead tiers with runtime measurement after initialization for more accurate planning.
 
 - **GGUF v4 support**: Future GGUF versions may change header layout. The parser should handle version negotiation gracefully.
