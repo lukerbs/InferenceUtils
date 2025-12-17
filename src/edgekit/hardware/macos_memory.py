@@ -18,7 +18,7 @@ for Apple Silicon ML Workloads"
 
 import ctypes
 from ctypes import Structure, c_uint32, c_uint64, byref, sizeof
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 # Mach host_statistics64 flavor constant (from mach/host_info.h)
 HOST_VM_INFO64 = 4
@@ -134,6 +134,7 @@ def get_macos_memory_stats() -> Dict[str, Any]:
     # Speculative: Read-ahead cache, zero cost to drop
     # External: File-backed pages, low cost to evict
     available_gb = free_gb + speculative_gb + to_gb(vm_stat.external_page_count)
+    available_gb = max(0.0, available_gb)  # Ensure never negative
     
     total_gb = total_mem.value / (1024**3)
     

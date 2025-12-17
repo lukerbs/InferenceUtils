@@ -30,7 +30,7 @@ GGUF_BPW_MAP = {
     "Q3_K_M": 3.91,
     "Q3_K_L": 4.27,
     "Q4_K_S": 4.58,
-    "Q4_K_M": 4.85,  # Most commonly used
+    "Q4_K_M": 4.80,  # Most commonly used
     "Q5_K_S": 5.54,
     "Q5_K_M": 5.69,
     "Q6_K": 6.59,
@@ -46,6 +46,9 @@ GGUF_BPW_MAP = {
     "IQ3_M": 3.66,
     "IQ4_NL": 4.50,
     "IQ4_XS": 4.25,
+    
+    # MXFP4 (Microsoft Floating Point 4-bit) - GPT-OSS models
+    "MXFP4": 4.25,
 }
 
 # MLX quantization types to Bits-Per-Weight

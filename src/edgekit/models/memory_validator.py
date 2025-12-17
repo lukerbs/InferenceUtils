@@ -7,13 +7,16 @@ Prevents OOM errors by checking hardware capacity against model requirements.
 
 import logging
 import os
+import traceback
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Literal, Optional, Tuple
 
-from huggingface_hub import snapshot_download, hf_hub_download, list_repo_files
+from huggingface_hub import snapshot_download, hf_hub_download, list_repo_files, scan_cache_dir
 
 from ..hardware import system_info
+from ..utils import check_internet
 
 # Module logger
 logger = logging.getLogger(__name__)
@@ -24,8 +27,8 @@ Engine = Literal["mlx_lm", "llama_cpp", "vllm"]
 from .model_inspector import (
     inspect_gguf_model,
     inspect_transformers_model,
-    ModelMetadata,
 )
+from .metadata_parser import ModelMetadata
 from .model_inspector_remote import (
     inspect_model_remote,
     RemoteInspectError,
@@ -36,6 +39,8 @@ from .memory_estimator import (
     estimate_mlx_memory,
     estimate_vllm_memory,
     calculate_max_safe_context,
+    calculate_kv_cache_gb,
+    KV_DTYPE_FP16,
     MemoryEstimate
 )
 
@@ -201,19 +206,21 @@ def _log_preflight_result(result: "PreflightResult") -> None:
     )
 
 
-def _make_decision(
+def _evaluate_model_capacity(
     utilization: float,
     estimate: MemoryEstimate,
     metadata: ModelMetadata,
     model_context_limit: int,
-    max_safe_context: int,
     available_gb: float,
-    mem_type: str,
     max_utilization: float = WARNING_THRESHOLD,
     min_context: int = MIN_VIABLE_CONTEXT
 ) -> PreflightResult:
     """
-    Make validation decision based on utilization and context.
+    Evaluate model capacity and determine usable context length.
+    
+    Validates whether a model can run given memory constraints and calculates
+    the maximum usable context length. Returns a PreflightResult with status
+    and recommendations.
     
     Algorithm:
     1. Try full context first (always respect model design)
@@ -227,14 +234,17 @@ def _make_decision(
         estimate: Memory estimate breakdown at full context
         metadata: Model metadata
         model_context_limit: Model's designed maximum context
-        max_safe_context: Maximum safe context we calculated
         available_gb: Available memory in GB
-        mem_type: Memory type description
         max_utilization: Target utilization threshold (default 0.85)
         min_context: Minimum viable context threshold (default 4096)
         
     Returns:
-        PreflightResult with appropriate status
+        PreflightResult with appropriate status and usable_context
+        
+    Note:
+        The returned usable_context uses max_utilization (default 85%) for safety margins.
+        estimate.max_safe_context (if set) reflects theoretical maximum at 100% utilization
+        and may differ from usable_context. Both values are valid but serve different purposes.
     """
     result: PreflightResult
     
@@ -248,7 +258,7 @@ def _make_decision(
             status=False,
             reason=PreflightReason.MEMORY_EXCEEDED,
             required_gb=base_memory_gb,
-                available_gb=available_gb,
+            available_gb=available_gb,
             utilization=base_utilization,
             context_limit=model_context_limit,
             usable_context=0,
@@ -294,11 +304,12 @@ def _make_decision(
     target_memory_gb = available_gb * max_utilization
     kv_budget_at_target = target_memory_gb - base_memory_gb
     
-    # Calculate what context achieves the target utilization
-    context_at_target = calculate_max_safe_context(kv_budget_at_target, metadata, safety_factor=1.0)
+    # Calculate maximum usable context at target utilization (e.g., 85%)
+    # This differs from estimate.max_safe_context which uses 100% utilization
+    max_usable_context_at_target = calculate_max_safe_context(kv_budget_at_target, metadata, safety_factor=1.0)
     
     # Check if reduced context meets minimum viability
-    if context_at_target < min_context:
+    if max_usable_context_at_target < min_context:
         result = PreflightResult(
             status=False,
             reason=PreflightReason.CONTEXT_INSUFFICIENT,
@@ -320,7 +331,7 @@ def _make_decision(
         available_gb=available_gb,
         utilization=max_utilization,
         context_limit=model_context_limit,
-        usable_context=context_at_target,
+        usable_context=max_usable_context_at_target,
         estimate=estimate
     )
     _log_preflight_result(result)
@@ -331,21 +342,78 @@ def _make_decision(
 # Helper Functions
 # ============================================================================
 
-def _resolve_model_path(model_id: str, engine: Engine) -> Tuple[str, str]:
+def _check_hf_cache(repo_id: str, engine: Engine) -> Optional[str]:
+    """
+    Check if a HuggingFace model exists in local cache (offline-safe).
+    
+    Uses scan_cache_dir() from huggingface_hub to find cached models. If that fails
+    (e.g., older huggingface_hub version or unexpected cache structure), falls back
+    to manual directory scanning of the cache location.
+    
+    Args:
+        repo_id: HuggingFace repository ID (e.g., "mlx-community/Llama-3-8B-4bit")
+        engine: Inference engine (determines which files to look for)
+        
+    Returns:
+        Local cache path if found, None otherwise
+    """
+    try:
+        # scan_cache_dir is offline-safe - it only reads local cache
+        cache_info = scan_cache_dir()
+        
+        # Look for the repo in cache
+        for repo in cache_info.repos:
+            if repo.repo_id == repo_id:
+                # Found in cache, return the path
+                return str(repo.repo_path)
+        
+        return None
+    except (OSError, ValueError, AttributeError):
+        # If scan_cache_dir fails or cache structure is unexpected
+        # Fallback: try to find cache manually
+        try:
+            cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
+            if not cache_dir.exists():
+                return None
+            
+            # Look for repo in cache structure
+            # Cache structure: models--org--name/
+            repo_slug = repo_id.replace("/", "--")
+            for model_dir in cache_dir.glob(f"models--{repo_slug}*"):
+                if model_dir.is_dir():
+                    # Check if it has the expected files
+                    if engine == "llama_cpp":
+                        if any(model_dir.rglob("*.gguf")):
+                            return str(model_dir)
+                    else:
+                        # For MLX/vLLM, check for config.json
+                        if (model_dir / "config.json").exists():
+                            return str(model_dir)
+        except (OSError, PermissionError):
+            # Cache directory access issues
+            return None
+        return None
+
+
+def _resolve_model_path(model_id: str, engine: Engine, is_offline: Optional[bool] = None) -> Tuple[str, str]:
     """
     Resolve model identifier to a local path.
     
     If model_id is a local path, returns it as-is.
-    If model_id is a HuggingFace repo ID, downloads/caches it and returns the path.
+    If model_id is a HuggingFace repo ID, checks cache first, then downloads if needed.
     
     Args:
         model_id: Either a local path or HuggingFace repo ID
         engine: Inference engine (determines download strategy)
+        is_offline: Optional offline status (if None, will check internet)
         
     Returns:
         Tuple of (local_path, model_name_for_display)
             - local_path: Path to the model on disk
             - model_name_for_display: Identifier for logs/metadata (repo ID or filename)
+            
+    Raises:
+        PreflightValidationError: If offline and model not in cache, or download fails
     """
     # Check if it's a local path
     if os.path.exists(model_id):
@@ -353,26 +421,48 @@ def _resolve_model_path(model_id: str, engine: Engine) -> Tuple[str, str]:
         display_name = os.path.basename(model_id).replace('.gguf', '')
         return model_id, display_name
     
-    # Assume it's a HuggingFace repo ID - download/cache it
-    if engine == "llama_cpp":
-        # For GGUF files, try to find and download specific .gguf file
-        try:
-            files = list_repo_files(model_id)
-            gguf_files = [f for f in files if f.endswith('.gguf')]
-            if gguf_files:
-                # Download the first GGUF file found
-                local_path = hf_hub_download(repo_id=model_id, filename=gguf_files[0])
-                return local_path, model_id
-        except Exception:
-            pass
-        
-        # Fallback: download entire repo
-        local_path = snapshot_download(repo_id=model_id)
-        return local_path, model_id
-    else:
-        # For MLX/vLLM, download the entire model repo
-        local_path = snapshot_download(repo_id=model_id)
-        return local_path, model_id
+    # Check cache first (works offline)
+    cached_path = _check_hf_cache(model_id, engine)
+    if cached_path:
+        return cached_path, model_id
+    
+    # Not in cache - check if we're offline
+    if is_offline is None:
+        is_offline = not check_internet()
+    
+    if is_offline:
+        raise PreflightValidationError(
+            f"Model '{model_id}' not found in cache and no internet connection. "
+            f"Please download the model first or provide a local path."
+        )
+    
+    # Online: proceed with download
+    try:
+        if engine == "llama_cpp":
+            # For GGUF files, try to find and download specific .gguf file
+            try:
+                files = list_repo_files(model_id)
+                gguf_files = [f for f in files if f.endswith('.gguf')]
+                if gguf_files:
+                    # Download the first GGUF file found
+                    local_path = hf_hub_download(repo_id=model_id, filename=gguf_files[0])
+                    return local_path, model_id
+            except (OSError, ValueError, ConnectionError):
+                # Network or file system errors - fall through to full repo download
+                pass
+            
+            # Fallback: download entire repo
+            local_path = snapshot_download(repo_id=model_id)
+            return local_path, model_id
+        else:
+            # For MLX/vLLM, download the entire model repo
+            local_path = snapshot_download(repo_id=model_id)
+            return local_path, model_id
+    except (OSError, ConnectionError, ValueError) as e:
+        raise PreflightValidationError(
+            f"Failed to download model '{model_id}': {e}. "
+            f"Please check your internet connection or ensure the model is cached locally."
+        )
 
 
 # ============================================================================
@@ -421,7 +511,7 @@ def _validate_gguf_with_metadata(
         context = metadata.model_max_context
         
         # Get available memory
-        available_gb, mem_type = get_available_memory("llama_cpp")
+        available_gb, _ = get_available_memory("llama_cpp")
         
         if available_gb <= 0:
             return PreflightResult(
@@ -454,14 +544,12 @@ def _validate_gguf_with_metadata(
         max_safe_context = calculate_max_safe_context(kv_budget, metadata)
         estimate.max_safe_context = max_safe_context
         
-        return _make_decision(
+        return _evaluate_model_capacity(
             utilization=utilization,
             estimate=estimate,
             metadata=metadata,
             model_context_limit=context,
-            max_safe_context=max_safe_context,
             available_gb=available_gb,
-            mem_type=mem_type,
             max_utilization=max_utilization,
             min_context=min_context
         )
@@ -506,6 +594,7 @@ def _validate_mlx_with_metadata(
         print(f"   Getting available memory...")
         available_gb, mem_type = get_available_memory("mlx_lm")
         print(f"   Available: {available_gb:.2f} GB ({mem_type})")
+        # Note: mem_type is used in the print statement above
         
         if available_gb <= 0:
             print(f"❌ DEBUG: Available memory is {available_gb} GB - returning UNKNOWN")
@@ -544,21 +633,18 @@ def _validate_mlx_with_metadata(
         max_safe_context = calculate_max_safe_context(kv_budget, metadata)
         estimate.max_safe_context = max_safe_context
         
-        return _make_decision(
+        return _evaluate_model_capacity(
             utilization=utilization,
             estimate=estimate,
             metadata=metadata,
             model_context_limit=context,
-            max_safe_context=max_safe_context,
             available_gb=available_gb,
-            mem_type=mem_type,
             max_utilization=max_utilization,
             min_context=min_context
         )
         
     except Exception as e:
         print(f"❌ DEBUG: Exception in MLX validation: {type(e).__name__}: {e}")
-        import traceback
         traceback.print_exc()
         return PreflightResult(
             status=False,
@@ -585,7 +671,7 @@ def _validate_vllm_with_metadata(
             )
         
         # Get available VRAM
-        available_gb, mem_type = get_available_memory("vllm")
+        available_gb, _ = get_available_memory("vllm")
         
         if available_gb <= 0:
             return PreflightResult(
@@ -624,38 +710,29 @@ def _validate_vllm_with_metadata(
         # For vLLM, we already know weights fit (Stage 1 passed)
         # Now calculate full memory with a reasonable context
         # Use the target context to get accurate utilization
-        from .memory_estimator import calculate_kv_cache_gb
-        kv_lora_rank = getattr(metadata, 'kv_lora_rank', None)
-        
-        if all([metadata.num_layers, metadata.num_kv_heads, metadata.head_dim]) or kv_lora_rank:
-            if not metadata.num_layers:
-                raise PreflightValidationError("Cannot calculate KV cache - missing num_layers")
-            if not kv_lora_rank and (not metadata.num_kv_heads or not metadata.head_dim):
-                raise PreflightValidationError("Cannot calculate KV cache - missing num_kv_heads or head_dim")
-            
-            from .memory_estimator import KV_DTYPE_FP16
+        try:
             kv_cache_gb = calculate_kv_cache_gb(
-                num_layers=metadata.num_layers,
-                num_kv_heads=metadata.num_kv_heads,
-                head_dim=metadata.head_dim,
+                metadata=metadata,
                 context_length=context,
-                dtype_bytes=KV_DTYPE_FP16,
-                kv_lora_rank=kv_lora_rank
+                dtype_bytes=KV_DTYPE_FP16
             )
             estimate.kv_cache_gb = kv_cache_gb
             estimate.total_required_gb = load_required + kv_cache_gb
+        except PreflightValidationError:
+            # If KV cache calculation fails, we can't determine full memory
+            # This is acceptable for vLLM stage 2 since we already validated load
+            estimate.kv_cache_gb = 0.0
+            estimate.total_required_gb = load_required
         
         utilization = estimate.total_required_gb / available_gb
         
         # Use standard decision logic like other backends
-        return _make_decision(
+        return _evaluate_model_capacity(
             utilization=utilization,
-                    estimate=estimate,
+            estimate=estimate,
             metadata=metadata,
             model_context_limit=context,
-            max_safe_context=max_safe_context,
-                available_gb=available_gb,
-            mem_type=mem_type,
+            available_gb=available_gb,
             max_utilization=max_utilization,
             min_context=min_context
         )
@@ -759,29 +836,66 @@ def model_preflight(
         metadata = _inspect_local(model_path, display_name, engine)
         return _validate_with_metadata(metadata, engine, max_utilization, min_context)
     
-    # Remote HuggingFace repo: try lightweight inspection first
-    try:
-        print(f"🔍 DEBUG: Attempting lightweight remote inspection for {model_id}")
-        logger.debug(f"Attempting lightweight remote inspection for {model_id}")
-        metadata = inspect_model_remote(model_id, engine)
-        print(f"✅ DEBUG: Remote inspection succeeded!")
-        print(f"   Model Type: {metadata.model_type}")
-        print(f"   Quantization: {metadata.quantization_type or 'unknown'}")
-        if metadata.params_billions:
-            print(f"   Params: {metadata.params_billions:.1f}B")
-        print(f"   Layers: {metadata.num_layers or 'unknown'}")
-        print(f"   Context: {metadata.model_max_context or 'unknown'}")
-        logger.debug(f"Remote inspection succeeded: {metadata}")
-        return _validate_with_metadata(metadata, engine, max_utilization, min_context)
-        
-    except RemoteInspectError as e:
-        # Light check failed, fall back to full download
-        print(f"⚠️  DEBUG: Light check failed: {e}")
-        print(f"   Falling back to full download...")
-        logger.info(f"Light check unavailable ({e}), downloading for inspection")
-        model_path, display_name = _resolve_model_path(model_id, engine)
-        metadata = _inspect_local(model_path, display_name, engine)
-        return _validate_with_metadata(metadata, engine, max_utilization, min_context)
+    # Check if we're offline (only check once)
+    is_offline = not check_internet()
+    
+    # Check cache once (works for both offline and online scenarios)
+    cached_path = _check_hf_cache(model_id, engine)
+    
+    if is_offline:
+        # Offline: use cache if available, otherwise error
+        if cached_path:
+            print(f"📦 DEBUG: Offline mode - using cached model from {cached_path}")
+            logger.debug(f"Offline mode: using cached model {cached_path}")
+            metadata = _inspect_local(cached_path, model_id, engine)
+            return _validate_with_metadata(metadata, engine, max_utilization, min_context)
+        else:
+            # Model not in cache and we're offline
+            raise PreflightValidationError(
+                f"Model '{model_id}' not found locally and no internet connection. "
+                f"Please ensure the model is downloaded or provide a local path."
+            )
+    else:
+        # Online: try lightweight remote inspection first
+        try:
+            print(f"🔍 DEBUG: Attempting lightweight remote inspection for {model_id}")
+            logger.debug(f"Attempting lightweight remote inspection for {model_id}")
+            metadata = inspect_model_remote(model_id, engine)
+            print(f"✅ DEBUG: Remote inspection succeeded!")
+            print(f"   Model Type: {metadata.model_type}")
+            print(f"   Quantization: {metadata.quantization_type or 'unknown'}")
+            if metadata.params_billions:
+                print(f"   Params: {metadata.params_billions:.1f}B")
+            print(f"   Layers: {metadata.num_layers or 'unknown'}")
+            print(f"   Context: {metadata.model_max_context or 'unknown'}")
+            logger.debug(f"Remote inspection succeeded: {metadata}")
+            return _validate_with_metadata(metadata, engine, max_utilization, min_context)
+            
+        except RemoteInspectError as e:
+            # Light check failed, use cache if available
+            if cached_path:
+                print(f"📦 DEBUG: Using cached model from {cached_path}")
+                logger.debug(f"Using cached model {cached_path}")
+                metadata = _inspect_local(cached_path, model_id, engine)
+                return _validate_with_metadata(metadata, engine, max_utilization, min_context)
+            
+            # Not in cache, attempt download
+            print(f"⚠️  DEBUG: Light check failed: {e}")
+            print(f"   Attempting to download model...")
+            logger.info(f"Light check unavailable ({e}), downloading for inspection")
+            try:
+                model_path, display_name = _resolve_model_path(model_id, engine, is_offline=False)
+                metadata = _inspect_local(model_path, display_name, engine)
+                return _validate_with_metadata(metadata, engine, max_utilization, min_context)
+            except PreflightValidationError:
+                # Re-raise our custom errors
+                raise
+            except (OSError, ConnectionError, ValueError) as download_error:
+                # Catch download failures
+                raise PreflightValidationError(
+                    f"Failed to download model '{model_id}': {download_error}. "
+                    f"Remote inspection failed and model not found in cache."
+                )
 
 
 def can_load(

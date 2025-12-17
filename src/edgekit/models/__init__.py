@@ -14,7 +14,7 @@ from .memory_validator import (
 )
 from .exceptions import PreflightValidationError
 
-from .model_inspector import ModelMetadata
+from .metadata_parser import ModelMetadata
 from .model_inspector_remote import (
     RemoteInspectError,
     inspect_model_remote,

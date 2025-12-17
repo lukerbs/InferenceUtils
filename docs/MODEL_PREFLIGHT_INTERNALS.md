@@ -1,7 +1,7 @@
 # Model Preflight Internals
 
 > **Internal Documentation** — For EdgeKit maintainers and contributors.  
-> Last updated: December 2024
+> Last updated: December 2024 (Updated for v1.0 - 6-Phase Refactor)
 
 This document explains how EdgeKit inspects models, estimates memory requirements, and validates preflight checks before loading. It covers the **how** (implementation approach), the **why** (rationale for design decisions), and **format-specific considerations & nuances** that aren't immediately obvious.
 
@@ -92,7 +92,9 @@ The `model_preflight()` function implements an intelligent two-stage workflow:
 
 ## Model Inspection
 
-The goal of model inspection is to extract **architectural metadata** required for memory estimation. The key values are:
+The goal of model inspection is to extract **architectural metadata** required for memory estimation. All parsing logic is centralized in the `MetadataParser` class (`src/edgekit/models/metadata_parser.py`), which ensures consistent behavior across local and remote inspection paths. The parser produces a standardized `ModelMetadata` dataclass that serves as the single source of truth for architectural parameters throughout the estimation pipeline.
+
+The key values are:
 
 | Field | Purpose |
 |-------|---------|
@@ -102,7 +104,7 @@ The goal of model inspection is to extract **architectural metadata** required f
 | `num_kv_heads` | **Critical** for GQA-aware KV cache calculation |
 | `head_dim` | Per-head dimension (`hidden_size / num_attention_heads`) |
 | `model_max_context` | Maximum context length for KV cache sizing |
-| `bits_per_weight` | Quantization precision (e.g., 4.85 for Q4_K_M) |
+| `bits_per_weight` | Quantization precision (e.g., 4.80 for Q4_K_M) |
 | `kv_lora_rank` | DeepSeek MLA compressed KV dimension (if applicable) |
 
 ### GGUF Format (Local)
@@ -301,6 +303,29 @@ For models with `exact_model_size_gb` from tensor iteration, we use that directl
 
 Mixture-of-Experts models keep router/gating weights at higher precision (typically Q6_K or Q8_0 even when experts are Q4_K_M). We apply a 5% overhead multiplier (1.05×).
 
+#### Mixed Precision Models (GPT-OSS)
+
+Some models use different quantization for different components:
+
+- **GPT-OSS**: Uses BF16 (16 bits) for embeddings and attention layers, MXFP4 (4.25 bits) for expert layers
+- **Component-wise calculation**: Weights are calculated separately for each component:
+  - Embeddings: `vocab_size × hidden_size × 2 bytes`
+  - Attention: `layers × (Q + K + V + O) × 2 bytes` (with GQA scaling)
+  - Experts: `layers × experts × 3 × hidden_size × intermediate_size × (4.25/8) bytes`
+- **Hybrid attention**: Models with explicit `layer_types` lists are parsed to count global vs local layers accurately
+- **Thin-deep topology**: GPT-OSS uses `intermediate_size = hidden_size` (instead of the typical 4×), which is correctly detected and accounted for
+
+#### Parameter Calculation from Architecture
+
+When `total_parameters` is missing from `config.json` (common in HuggingFace repos), we calculate it from architectural dimensions using the `calculate_architecture_params()` function:
+
+**Formula:**
+- Embeddings: `2 × vocab_size × hidden_size` (input + output)
+- Attention: `layers × (2h² + 2h² × gqa_ratio)` (Q+O + K+V scaled for GQA)
+- FFN: `layers × experts × 3 × hidden_size × intermediate_size` (SwiGLU: Gate+Up+Down)
+
+This "Recipe Calculator" enables accurate memory estimation even when parameter counts aren't explicitly labeled, eliminating the need for filename-based heuristics.
+
 ---
 
 ### KV Cache Memory
@@ -369,9 +394,9 @@ The presence of `{arch}.attention.kv_lora_rank` in GGUF metadata indicates MLA. 
 
 When `kv_lora_rank` is set, we use the compressed formula:
 
-**KV Cache (GB) = 2 × layers × kv_lora_rank × context × dtype_bytes / (1024³)**
+**KV Cache (GB) = layers × (kv_lora_rank + rope_dim) × context × dtype_bytes / (1024³)**
 
-Note: The formula uses `kv_lora_rank` directly instead of `kv_heads × head_dim`.
+Note: The formula uses `kv_lora_rank + rope_dim` directly. The factor of 2 is removed because MLA stores compressed latent vectors, not separate K and V tensors. The `rope_dim` accounts for RoPE (Rotary Position Embedding) overhead in the compressed representation.
 
 #### Impact
 
@@ -419,11 +444,12 @@ K-quants use k-means clustering for quantization. They're the most common format
 | `Q3_K_M` | 3.91 | Medium 3-bit |
 | `Q3_K_L` | 4.27 | Large 3-bit |
 | `Q4_K_S` | 4.58 | Small 4-bit |
-| `Q4_K_M` | 4.85 | **Most commonly used** |
+| `Q4_K_M` | 4.80 | **Most commonly used** |
 | `Q5_K_S` | 5.54 | Small 5-bit |
 | `Q5_K_M` | 5.69 | Medium 5-bit |
 | `Q6_K` | 6.59 | High quality |
 | `Q8_K` | 8.50 | Near-lossless |
+| `MXFP4` | 4.25 | Mixed precision (GPT-OSS expert layers) |
 
 The "K" suffix indicates k-means quantization. S/M/L suffixes indicate small/medium/large block sizes (affecting quality vs compression tradeoff).
 
@@ -621,7 +647,7 @@ When full context doesn't fit, we calculate the maximum safe context by first co
 
 **Bytes per token calculation:**
 - **Standard attention**: 2 × layers × kv_heads × head_dim × dtype_bytes
-- **MLA (DeepSeek)**: 2 × layers × kv_lora_rank × dtype_bytes
+- **MLA (DeepSeek)**: layers × (kv_lora_rank + rope_dim) × dtype_bytes
 
 We enforce a minimum viable context of 16K tokens—below this, the model isn't useful for most applications.
 

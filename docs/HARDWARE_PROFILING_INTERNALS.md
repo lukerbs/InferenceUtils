@@ -1,7 +1,7 @@
 # Hardware Profiling Internals
 
 > **Internal Documentation** — For EdgeKit maintainers and contributors.  
-> Last updated: December 2024
+> Last updated: December 2024 (Updated for v1.0 - 6-Phase Refactor)
 
 This document explains how EdgeKit detects hardware capabilities and calculates available memory across different operating systems and hardware platforms. It covers the **how** (implementation approach), the **why** (rationale for design decisions), and **platform-specific considerations & nuances** that aren't immediately obvious.
 
@@ -404,7 +404,7 @@ Each inference backend has different memory characteristics:
 - Uses dedicated GPU VRAM
 - Source: NVML (NVIDIA Management Library)
 - Prefers actual available VRAM (accounts for current usage)
-- Falls back to 90% of total VRAM (vLLM's default `gpu_memory_utilization=0.9`)
+- **90% utilization rule**: vLLM reserves 90% of VRAM by default (`gpu_memory_utilization=0.9`). We account for this by calculating `total_required_gb = (weights + overhead) / 0.90`, which represents the implicit memory reservation. This ensures our estimates match vLLM's actual behavior.
 - ECC overhead is already reflected in NVML's reported memory
 
 **llama.cpp (CPU)**

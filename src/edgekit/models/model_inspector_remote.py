@@ -22,11 +22,11 @@ from gguf import GGMLQuantizationType
 
 from .quantization_maps import (
     get_gguf_bpw,
-    get_mlx_bpw_for_group_size,
     parse_quantization_from_filename,
     parse_quantization_from_model_id,
 )
-from .model_inspector import ModelMetadata, _extract_params_from_name
+from .metadata_parser import ModelMetadata, MetadataParser, extract_params_from_name
+from ..utils import check_internet
 
 logger = logging.getLogger(__name__)
 
@@ -387,83 +387,8 @@ def inspect_gguf_remote(repo_id: str) -> "ModelMetadata":
     # Parse KV metadata block
     gguf_metadata = _parse_gguf_kv_block(data, kv_count, offset=24)
     
-    # Build ModelMetadata from parsed data
-    metadata = ModelMetadata(
-        model_id=repo_id,
-        model_type="gguf"
-    )
-    
-    # Get architecture prefix (e.g., "llama", "qwen2", "phi3")
-    arch = gguf_metadata.get('general.architecture', 'llama')
-    
-    # Helper to get field with architecture prefix fallback
-    def get_arch_field(suffix: str, default=None):
-        """Get field with architecture prefix, falling back to llama prefix.
-        
-        Note: general.* keys do NOT exist for structural params per GGUF spec.
-        The llama prefix serves as a "super-architecture" for many model families.
-        """
-        return (
-            gguf_metadata.get(f'{arch}.{suffix}') or
-            gguf_metadata.get(f'llama.{suffix}') or  # Super-architecture fallback
-            default
-        )
-    
-    # Extract architecture parameters
-    metadata.num_layers = get_arch_field('block_count')
-    metadata.num_attention_heads = get_arch_field('attention.head_count')
-    metadata.num_kv_heads = get_arch_field('attention.head_count_kv') or metadata.num_attention_heads
-    metadata.hidden_size = get_arch_field('embedding_length')
-    metadata.vocab_size = get_arch_field('vocab_size')
-    
-    # Calculate head dimension
-    if metadata.hidden_size and metadata.num_attention_heads:
-        metadata.head_dim = metadata.hidden_size // metadata.num_attention_heads
-    
-    # Context length - search for any key ending with context_length
-    for key, value in gguf_metadata.items():
-        if key.endswith('.context_length'):
-            metadata.base_context_length = value
-            metadata.model_max_context = value
-            break
-    
-    # MoE detection
-    num_experts = get_arch_field('expert_count')
-    if num_experts and num_experts > 1:
-        metadata.is_moe = True
-        metadata.num_experts = num_experts
-    
-    # Sliding window attention (for Mistral, Phi-3, etc.)
-    sliding_window = get_arch_field('attention.sliding_window') or get_arch_field('rope.sliding_window')
-    if sliding_window:
-        metadata.sliding_window = sliding_window
-    
-    # DeepSeek MLA detection (kv_lora_rank indicates compressed KV cache)
-    kv_lora_rank = get_arch_field('attention.kv_lora_rank')
-    if kv_lora_rank:
-        metadata.kv_lora_rank = kv_lora_rank
-    
-    # Quantization from file_type
-    file_type = gguf_metadata.get('general.file_type')
-    if file_type is not None:
-        try:
-            quant_enum = GGMLQuantizationType(file_type)
-            metadata.quantization_type = quant_enum.name
-            metadata.bits_per_weight = get_gguf_bpw(quant_enum.name)
-        except (ValueError, Exception):
-            # Fall back to filename parsing
-            quant, bpw = parse_quantization_from_filename(gguf_filename)
-            metadata.quantization_type = quant
-            metadata.bits_per_weight = bpw
-    else:
-        quant, bpw = parse_quantization_from_filename(gguf_filename)
-        metadata.quantization_type = quant
-        metadata.bits_per_weight = bpw
-    
-    # Estimate params from model name
-    metadata.params_billions = _extract_params_from_name(repo_id)
-    
-    return metadata
+    # Parse metadata using centralized parser
+    return MetadataParser.parse_gguf(gguf_metadata, repo_id, filename=gguf_filename)
 
 
 def inspect_safetensors_remote(repo_id: str) -> "ModelMetadata":
@@ -486,88 +411,8 @@ def inspect_safetensors_remote(repo_id: str) -> "ModelMetadata":
     # Fetch config.json for architecture parameters
     config = _fetch_json_file(repo_id, "config.json")
     
-    # Build base metadata from config
-    metadata = ModelMetadata(
-        model_id=repo_id,
-        model_type="transformers"
-    )
-    metadata.raw_config = config
-    
-    # Handle nested configs (common in multimodal models)
-    text_config = config.get('text_config', config)
-    
-    # Extract architecture parameters
-    metadata.num_layers = (
-        text_config.get('num_hidden_layers') or
-        text_config.get('n_layer') or
-        text_config.get('num_layers')
-    )
-    
-    metadata.hidden_size = (
-        text_config.get('hidden_size') or
-        text_config.get('n_embd') or
-        text_config.get('d_model')
-    )
-    
-    metadata.num_attention_heads = (
-        text_config.get('num_attention_heads') or
-        text_config.get('n_head') or
-        text_config.get('num_heads')
-    )
-    
-    # KV heads (GQA-aware)
-    metadata.num_kv_heads = (
-        text_config.get('num_key_value_heads') or
-        text_config.get('n_kv_heads') or
-        text_config.get('num_kv_heads') or
-        text_config.get('kv_heads') or
-        metadata.num_attention_heads
-    )
-    
-    if text_config.get('multi_query', False):
-        metadata.num_kv_heads = 1
-    
-    # Calculate head dimension
-    if metadata.hidden_size and metadata.num_attention_heads:
-        metadata.head_dim = metadata.hidden_size // metadata.num_attention_heads
-    
-    metadata.vocab_size = text_config.get('vocab_size')
-    
-    # Context length
-    for field in ['max_position_embeddings', 'sliding_window', 'n_positions', 'n_ctx', 'max_seq_len']:
-        if field in text_config:
-            metadata.base_context_length = text_config[field]
-            break
-    
-    # RoPE scaling
-    rope_scaling = text_config.get('rope_scaling')
-    if rope_scaling and isinstance(rope_scaling, dict):
-        scaling_type = rope_scaling.get('type', '')
-        factor = rope_scaling.get('factor', 1.0)
-        if scaling_type in ['linear', 'dynamic', 'yarn', 'su', 'longrope']:
-            metadata.rope_scaling_factor = factor
-    
-    if metadata.base_context_length:
-        metadata.model_max_context = int(metadata.base_context_length * metadata.rope_scaling_factor)
-    
-    metadata.sliding_window = text_config.get('sliding_window')
-    
-    # MoE detection
-    num_experts = text_config.get('num_local_experts') or text_config.get('num_experts')
-    if num_experts and num_experts > 1:
-        metadata.is_moe = True
-        metadata.num_experts = num_experts
-    
-    # Multimodal detection
-    if 'vision_config' in config or 'image_processor' in str(config):
-        metadata.is_multimodal = True
-    
-    # Parameter count
-    params = text_config.get('num_parameters') or text_config.get('n_params')
-    if params:
-        metadata.params_billions = params / 1e9 if params > 1e6 else params
-    else:
-        metadata.params_billions = _extract_params_from_name(repo_id)
+    # Parse base metadata from config using centralized parser
+    metadata = MetadataParser.parse_transformers(config, repo_id)
     
     # Now fetch safetensors header to determine actual dtype
     try:
@@ -674,114 +519,8 @@ def inspect_mlx_remote(repo_id: str) -> "ModelMetadata":
     # Fetch config.json
     config = _fetch_json_file(repo_id, "config.json")
     
-    # Build base metadata
-    metadata = ModelMetadata(
-        model_id=repo_id,
-        model_type="mlx"
-    )
-    metadata.raw_config = config
-    
-    # Handle nested configs
-    text_config = config.get('text_config', config)
-    
-    # Extract architecture parameters (same as safetensors)
-    metadata.num_layers = (
-        text_config.get('num_hidden_layers') or
-        text_config.get('n_layer') or
-        text_config.get('num_layers')
-    )
-    
-    metadata.hidden_size = (
-        text_config.get('hidden_size') or
-        text_config.get('n_embd') or
-        text_config.get('d_model')
-    )
-    
-    metadata.num_attention_heads = (
-        text_config.get('num_attention_heads') or
-        text_config.get('n_head') or
-        text_config.get('num_heads')
-    )
-    
-    metadata.num_kv_heads = (
-        text_config.get('num_key_value_heads') or
-        text_config.get('n_kv_heads') or
-        text_config.get('num_kv_heads') or
-        text_config.get('kv_heads') or
-        metadata.num_attention_heads
-    )
-    
-    if text_config.get('multi_query', False):
-        metadata.num_kv_heads = 1
-    
-    if metadata.hidden_size and metadata.num_attention_heads:
-        metadata.head_dim = metadata.hidden_size // metadata.num_attention_heads
-    
-    metadata.vocab_size = text_config.get('vocab_size')
-    
-    # Context length
-    for field in ['max_position_embeddings', 'sliding_window', 'n_positions', 'n_ctx', 'max_seq_len']:
-        if field in text_config:
-            metadata.base_context_length = text_config[field]
-            break
-    
-    # RoPE scaling
-    rope_scaling = text_config.get('rope_scaling')
-    if rope_scaling and isinstance(rope_scaling, dict):
-        scaling_type = rope_scaling.get('type', '')
-        factor = rope_scaling.get('factor', 1.0)
-        if scaling_type in ['linear', 'dynamic', 'yarn', 'su', 'longrope']:
-            metadata.rope_scaling_factor = factor
-    
-    if metadata.base_context_length:
-        metadata.model_max_context = int(metadata.base_context_length * metadata.rope_scaling_factor)
-    
-    metadata.sliding_window = text_config.get('sliding_window')
-    
-    # MoE detection
-    num_experts = text_config.get('num_local_experts') or text_config.get('num_experts')
-    if num_experts and num_experts > 1:
-        metadata.is_moe = True
-        metadata.num_experts = num_experts
-    
-    # Multimodal detection
-    if 'vision_config' in config or 'image_processor' in str(config):
-        metadata.is_multimodal = True
-    
-    # Parameter count
-    params = text_config.get('num_parameters') or text_config.get('n_params')
-    if params:
-        metadata.params_billions = params / 1e9 if params > 1e6 else params
-    else:
-        metadata.params_billions = _extract_params_from_name(repo_id)
-    
-    # MLX Quantization - config.json is authoritative
-    # Check both 'quantization_config' and 'quantization' keys
-    quant_config = (
-        text_config.get('quantization_config') or
-        config.get('quantization_config') or
-        config.get('quantization', {})
-    )
-    
-    if quant_config and isinstance(quant_config, dict):
-        bits = quant_config.get('bits', 16)
-        group_size = quant_config.get('group_size', 64)  # MLX default
-        metadata.quantization_type = f"{bits}bit"
-        # Use group-size-aware BPW calculation
-        metadata.bits_per_weight = get_mlx_bpw_for_group_size(bits, group_size)
-    else:
-        # Fallback to model ID parsing
-        quant_type, bpw = parse_quantization_from_model_id(repo_id)
-        metadata.quantization_type = quant_type
-        metadata.bits_per_weight = bpw
-    
-    # Estimate model size
-    if metadata.params_billions:
-        metadata.exact_model_size_gb = (
-            metadata.params_billions * 1e9 * metadata.bits_per_weight
-        ) / 8 / (1024**3)
-    
-    return metadata
+    # Parse metadata using centralized parser with MLX type hint
+    return MetadataParser.parse_transformers(config, repo_id, model_type_hint="mlx")
 
 
 def inspect_model_remote(repo_id: str, engine: str) -> "ModelMetadata":
@@ -806,6 +545,9 @@ def inspect_model_remote(repo_id: str, engine: str) -> "ModelMetadata":
     Raises:
         RemoteInspectError: If inspection fails (caller should fall back to full download)
     """
+    if not check_internet():
+        raise RemoteInspectError("No internet connection")
+
     try:
         if engine == "llama_cpp":
             return inspect_gguf_remote(repo_id)
