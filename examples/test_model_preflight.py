@@ -8,8 +8,9 @@ from edgekit import model_preflight, system_info
 
 # Model to test
 # LLM_MODEL = "mlx-community/gemma-3n-E4B-it-lm-4bit"
-LLM_MODEL = "mlx-community/Mistral-Small-24B-Instruct-2501-4bit"
+# LLM_MODEL = "mlx-community/Mistral-Small-24B-Instruct-2501-4bit"
 # LLM_MODEL = "lmstudio-community/Qwen3-Coder-30B-A3B-Instruct-MLX-6bit"
+LLM_MODEL = "mlx-community/gpt-oss-20b-MXFP4-Q8"
 
 def main():
     print("=== Model Preflight Check ===\n")
@@ -58,7 +59,6 @@ def main():
         print(f"\nDetailed Breakdown:")
         print(f"  Model Weights: {result.estimate.weights_gb:.2f} GB")
         print(f"  KV Cache: {result.estimate.kv_cache_gb:.2f} GB")
-        print(f"  Overhead: {result.estimate.overhead_gb:.2f} GB")
         print(f"  Quantization: {result.estimate.quantization}")
         print(f"  Parameters: {result.estimate.params_billions:.1f}B")
     

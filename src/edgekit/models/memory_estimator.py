@@ -2,7 +2,7 @@
 Memory Estimator for LLM Inference
 
 Provides accurate memory estimation for different inference backends.
-Uses fixed overhead tiers and precise KV cache calculations.
+Uses precise KV cache calculations.
 """
 
 from dataclasses import dataclass
@@ -25,20 +25,12 @@ KV_DTYPE_FP8 = 1.0    # Halves KV cache size
 KV_DTYPE_Q8 = 1.0     # 8-bit quantized cache
 KV_DTYPE_Q4 = 0.5     # 4-bit quantized cache (experimental)
 
-# Activation overhead tiers (GB) - empirically validated
-OVERHEAD_MOE = 3.0           # MoE routing overhead
-OVERHEAD_SMALL = 1.2         # Small models (<10B params)
-OVERHEAD_MEDIUM = 2.5        # Medium models (10-30B params)
-OVERHEAD_LARGE = 4.0         # Large models (>30B params)
-
 # Model size thresholds (billions of parameters)
 SMALL_MODEL_THRESHOLD = 10   # Below this = small model tier
 MEDIUM_MODEL_THRESHOLD = 30  # Below this (but >= 10) = medium model tier
 
 # Backend-specific multipliers
-MLX_WIRING_MULTIPLIER = 1.15      # MLX graph compilation overhead (+15%)
 VLLM_GPU_UTILIZATION = 0.90       # vLLM reserves 90% of VRAM by default
-VLLM_CUDA_CONTEXT_GB = 0.5        # CUDA/PyTorch/NCCL overhead for vLLM
 
 # Context calculation bounds
 MIN_CONTEXT_BOUND = 16384         # Minimum viable for calculate_max_safe_context
@@ -55,7 +47,6 @@ class MemoryEstimate:
     # Component sizes in GB
     weights_gb: float
     kv_cache_gb: float
-    overhead_gb: float
     
     # Total and available
     total_required_gb: float
@@ -75,48 +66,8 @@ class MemoryEstimate:
         """Concise representation for debugging."""
         return (
             f"MemoryEstimate(total={self.total_required_gb:.1f}GB, "
-            f"weights={self.weights_gb:.1f}GB, kv={self.kv_cache_gb:.1f}GB, "
-            f"overhead={self.overhead_gb:.1f}GB)"
+            f"weights={self.weights_gb:.1f}GB, kv={self.kv_cache_gb:.1f}GB)"
         )
-
-
-def get_activation_overhead_gb(
-    params_billions: float,
-    is_moe: bool = False,
-    backend: str = "mlx_lm"
-) -> float:
-    """
-    Get fixed activation overhead in GB based on model size tier.
-    
-    These values account for:
-    - Scratch buffers for matrix multiplication
-    - Intermediate activation tensors
-    - Runtime overhead (Python, CUDA context, etc.)
-    - Graph compilation overhead (MLX)
-    
-    Args:
-        params_billions: Model parameter count in billions
-        is_moe: Whether this is a Mixture of Experts model
-        backend: Inference backend ("mlx_lm", "vllm", "llama_cpp")
-        
-    Returns:
-        Overhead in GB
-    """
-    # Fixed tiers based on empirical measurements
-    if is_moe:
-        base = OVERHEAD_MOE
-    elif params_billions < SMALL_MODEL_THRESHOLD:
-        base = OVERHEAD_SMALL
-    elif params_billions <= MEDIUM_MODEL_THRESHOLD:
-        base = OVERHEAD_MEDIUM
-    else:
-        base = OVERHEAD_LARGE
-    
-    # MLX has additional graph compilation ("wiring") overhead
-    if backend == "mlx_lm":
-        base *= MLX_WIRING_MULTIPLIER
-    
-    return base
 
 
 def calculate_kv_cache_gb(
@@ -378,22 +329,11 @@ def estimate_llamacpp_memory(
     except Exception as e:
         raise PreflightValidationError(f"KV cache calculation failed: {e}")
     
-    # Overhead
-    if not metadata.params_billions:
-        raise PreflightValidationError("Cannot determine overhead - params unknown")
-        
-    overhead_gb = get_activation_overhead_gb(
-        params_billions=metadata.params_billions,
-        is_moe=metadata.is_moe,
-        backend="llama_cpp"
-    )
-    
-    total_required_gb = weights_gb + kv_cache_gb + overhead_gb
+    total_required_gb = weights_gb + kv_cache_gb
     
     return MemoryEstimate(
         weights_gb=weights_gb,
         kv_cache_gb=kv_cache_gb,
-        overhead_gb=overhead_gb,
         total_required_gb=total_required_gb,
         available_gb=0.0,
         context_length=context_length,
@@ -440,22 +380,11 @@ def estimate_mlx_memory(
     except Exception as e:
         raise PreflightValidationError(f"KV cache calculation failed: {e}")
     
-    # Overhead
-    if not metadata.params_billions:
-        raise PreflightValidationError("Cannot determine overhead - params unknown")
-        
-    overhead_gb = get_activation_overhead_gb(
-        params_billions=metadata.params_billions,
-        is_moe=metadata.is_moe,
-        backend="mlx_lm"
-    )
-    
-    total_required_gb = weights_gb + kv_cache_gb + overhead_gb
+    total_required_gb = weights_gb + kv_cache_gb
     
     return MemoryEstimate(
         weights_gb=weights_gb,
         kv_cache_gb=kv_cache_gb,
-        overhead_gb=overhead_gb,
         total_required_gb=total_required_gb,
         available_gb=0.0,
         context_length=context_length,
@@ -500,30 +429,13 @@ def estimate_vllm_memory(
     if metadata.is_moe:
         weights_gb *= MOE_WEIGHT_OVERHEAD
     
-    # Overhead
-    if not metadata.params_billions:
-        raise PreflightValidationError("Cannot determine overhead - params unknown")
-        
-    base_overhead = get_activation_overhead_gb(
-        params_billions=metadata.params_billions,
-        is_moe=metadata.is_moe,
-        backend="vllm"
-    )
-    
-    # Calculate raw required (weights + base overhead)
-    raw_required = weights_gb + base_overhead
-    
     # Apply vLLM 90% GPU utilization rule
     # vLLM reserves 90% of VRAM, so we need to account for this reservation
-    total_required_gb = raw_required / VLLM_GPU_UTILIZATION
-    
-    # Overhead now includes the implicit reservation space
-    overhead_gb = total_required_gb - weights_gb
+    total_required_gb = weights_gb / VLLM_GPU_UTILIZATION
     
     return MemoryEstimate(
         weights_gb=weights_gb,
         kv_cache_gb=0.0,
-        overhead_gb=overhead_gb,
         total_required_gb=total_required_gb,
         available_gb=0.0,
         context_length=0,

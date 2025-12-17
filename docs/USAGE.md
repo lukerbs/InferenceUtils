@@ -604,7 +604,6 @@ Detailed memory breakdown for a model.
 |-------|------|-------------|
 | `weights_gb` | `float` | Model weights size in GB |
 | `kv_cache_gb` | `float` | KV cache size in GB |
-| `overhead_gb` | `float` | Backend overhead (activation buffers, runtime) in GB |
 | `total_required_gb` | `float` | Total memory required in GB |
 | `available_gb` | `float` | Available memory in GB |
 | `context_length` | `int` | Context length used for calculation |

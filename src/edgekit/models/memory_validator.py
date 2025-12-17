@@ -72,7 +72,7 @@ class PreflightReason(Enum):
     
     # Failures (status=False)
     VALIDATION_FAILED = "Cannot validate - model metadata incomplete"
-    MEMORY_EXCEEDED = "Model too large - weights and overhead exceed memory limit"
+    MEMORY_EXCEEDED = "Model too large - weights exceed memory limit"
     CONTEXT_INSUFFICIENT = "Model would require impractically low context (<4K tokens) to fit"
     
     # Success (status=True)
@@ -248,8 +248,8 @@ def _evaluate_model_capacity(
     """
     result: PreflightResult
     
-    # Calculate base memory (weights + overhead only, no KV cache)
-    base_memory_gb = estimate.weights_gb + estimate.overhead_gb
+    # Calculate base memory (weights only, no KV cache)
+    base_memory_gb = estimate.weights_gb
     base_utilization = base_memory_gb / available_gb
     
     # SCENARIO 1: Model base is too large even with zero context
@@ -529,7 +529,7 @@ def _validate_gguf_with_metadata(
         utilization = estimate.total_required_gb / available_gb
         
         # Calculate max safe context
-        kv_budget = available_gb - estimate.weights_gb - estimate.overhead_gb
+        kv_budget = (available_gb * max_utilization) - estimate.weights_gb
         if kv_budget <= 0:
             return PreflightResult(
                 status=False,
@@ -611,14 +611,13 @@ def _validate_mlx_with_metadata(
         estimate.available_gb = available_gb
         print(f"   Weights: {estimate.weights_gb:.2f} GB")
         print(f"   KV Cache: {estimate.kv_cache_gb:.2f} GB")
-        print(f"   Overhead: {estimate.overhead_gb:.2f} GB")
         print(f"   Total Required: {estimate.total_required_gb:.2f} GB")
         
         # Calculate utilization
         utilization = estimate.total_required_gb / available_gb
         
         # Calculate max safe context
-        kv_budget = available_gb - estimate.weights_gb - estimate.overhead_gb
+        kv_budget = (available_gb * max_utilization) - estimate.weights_gb
         if kv_budget <= 0:
             return PreflightResult(
                 status=False,
@@ -703,7 +702,9 @@ def _validate_vllm_with_metadata(
         # Stage 2: Calculate context that fits in remaining space
         # vLLM uses PagedAttention to dynamically allocate context
         context = metadata.model_max_context
-        kv_budget = available_gb - load_required
+        # Use max_utilization for consistency with other backends
+        # Note: load_required already accounts for vLLM's 90% GPU reservation
+        kv_budget = (available_gb * max_utilization) - estimate.weights_gb
         max_safe_context = calculate_max_safe_context(kv_budget, metadata)
         estimate.max_safe_context = max_safe_context
         
